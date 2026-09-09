@@ -1,588 +1,367 @@
 import 'react-native-gesture-handler';
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TouchableOpacity,
   StatusBar,
-  TextInput
+  Dimensions,
+  Animated,
 } from 'react-native';
 import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
 import Icon from '@expo/vector-icons/MaterialCommunityIcons';
-
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
-import { SafeAreaView } from 'react-native-safe-area-context';
 import { darkMapStyle } from './src/styles/mapStyle';
-import { loadBundledTfliteModel } from './src/ml/tflite';
+import { loadBundledTfliteModel, runPotholeInference, MODEL_CONFIG } from './src/ml/tflite';
 import * as Location from 'expo-location';
+import { Accelerometer, Gyroscope } from 'expo-sensors';
+import { BlurView } from 'expo-blur';
 import { CameraView, useCameraPermissions } from 'expo-camera';
+import * as Speech from 'expo-speech';
 
-// Mock Destination Data
+import { listenForGlobalPotholes, syncPothole, removeFixedPothole, GlobalPothole } from './src/services/backendSync';
+
+const { width } = Dimensions.get('window');
+
+// ── Utility: Haversine Distance ──────────────────────────────────────────────
+function getDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const R = 6371e3; // metres
+  const p1 = lat1 * Math.PI/180;
+  const p2 = lat2 * Math.PI/180;
+  const dp = (lat2-lat1) * Math.PI/180;
+  const dl = (lon2-lon1) * Math.PI/180;
+  const a = Math.sin(dp/2) * Math.sin(dp/2) +
+            Math.cos(p1) * Math.cos(p2) *
+            Math.sin(dl/2) * Math.sin(dl/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
 const initialDestLocation = { latitude: 12.9538, longitude: 74.8340 };
-
-const getManeuverIcon = (modifier: string) => {
-  if (!modifier) return 'arrow-up';
-  if (modifier.includes('left')) return 'arrow-left-top';
-  if (modifier.includes('right')) return 'arrow-right-top';
-  if (modifier.includes('uturn')) return 'arrow-u-left-top';
-  return 'arrow-up';
-};
-
-const formatDistance = (meters: number) => {
-  if (meters > 1000) return (meters / 1000).toFixed(1) + ' km';
-  return Math.round(meters) + ' m';
-};
 
 const App = () => {
   const mapRef = useRef<MapView>(null);
   const [location, setLocation] = useState<Location.LocationObject | null>(null);
-  const [isCameraActive, setIsCameraActive] = useState(false);
-  const [potholes, setPotholes] = useState<{id: string, latitude: number, longitude: number, severity: 'low'|'medium'|'high'}[]>([]);
+  const [potholes, setPotholes] = useState<GlobalPothole[]>([]);
+  const [notification, setNotification] = useState<string | null>(null);
+  const [isVoiceEnabled, setIsVoiceEnabled] = useState(true);
+  const [lastWarnedPotholeId, setLastWarnedPotholeId] = useState<string | null>(null);
+  
+  const [isSensorActive, setIsSensorActive] = useState(false);
+  const [isDashcamMode, setIsDashcamMode] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
-  const cameraRef = useRef<any>(null);
-  const [boundingBoxes, setBoundingBoxes] = useState<any[]>([]);
-
-  const [startText, setStartText] = useState('My Location');
-  const [destText, setDestText] = useState('City Center Mall');
-  const [destination, setDestination] = useState(initialDestLocation);
-  const [sourceLocation, setSourceLocation] = useState<{latitude: number, longitude: number} | null>(null);
-
-  const [searchResults, setSearchResults] = useState<any[]>([]);
-  const [activeSearchType, setActiveSearchType] = useState<'source' | 'dest' | null>(null);
+  const sensorWindowRef = useRef<number[][]>([]);
+  const tfliteModelRef = useRef<any>(null);
+  const lastDetectionTimeRef = useRef<number>(0);
+  const [detectionCount, setDetectionCount] = useState<number>(0);
   const [routeCoords, setRouteCoords] = useState<{latitude: number, longitude: number}[]>([]);
-  const [routeDetails, setRouteDetails] = useState<any>(null);
   const [isNavigating, setIsNavigating] = useState(false);
-  const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [tfliteStatus, setTfliteStatus] = useState<'loading' | 'loaded' | 'unavailable' | 'error'>('loading');
-  const [tfliteMessage, setTfliteMessage] = useState('Loading bundled TFLite model...');
+  
+  // Dynamic Warning State
+  const [closestDistance, setClosestDistance] = useState<number | null>(null);
 
   const fetchRoute = async (startCoord: {latitude: number, longitude: number}, endCoord: {latitude: number, longitude: number}) => {
     try {
-      const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${startCoord.longitude},${startCoord.latitude};${endCoord.longitude},${endCoord.latitude}?overview=full&geometries=geojson&steps=true`);
+      const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${startCoord.longitude},${startCoord.latitude};${endCoord.longitude},${endCoord.latitude}?overview=full&geometries=geojson`);
       const data = await res.json();
       if (data.routes && data.routes.length > 0) {
-        const route = data.routes[0];
-        const coords = route.geometry.coordinates.map((c: number[]) => ({
+        const coords = data.routes[0].geometry.coordinates.map((c: number[]) => ({
           latitude: c[1],
           longitude: c[0]
         }));
         setRouteCoords(coords);
-
-        const steps = route.legs[0]?.steps || [];
-        setRouteDetails({
-          distanceMs: route.distance, 
-          durationS: route.duration, 
-          nextStep: steps.length > 0 ? steps[0] : null,
-          followingStep: steps.length > 1 ? steps[1] : null,
-        });
       }
     } catch (e) {
       console.log('Routing error:', e);
     }
   };
 
-  const handleSearch = async (text: string, type: 'source' | 'dest') => {
-    if (type === 'source') setStartText(text);
-    if (type === 'dest') setDestText(text);
-
-    if (searchTimeoutRef.current) {
-      clearTimeout(searchTimeoutRef.current);
-    }
-
-    if (text.length > 2) {
-      setActiveSearchType(type);
-      searchTimeoutRef.current = setTimeout(async () => {
-        try {
-          const rootLoc = location ? { latitude: location.coords.latitude, longitude: location.coords.longitude } : { latitude: 12.9141, longitude: 74.8560 };
-          
-          // Using Photon (by Komoot) instead of Nominatim because nominatim bans live type-ahead autocomplete
-          const res = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(text)}&lat=${rootLoc.latitude}&lon=${rootLoc.longitude}&limit=5`);
-          
-          if (!res.ok) {
-            throw new Error("Photon Autocomplete failed");
-          }
-          
-          const data = await res.json();
-          
-          if (data && data.features && data.features.length > 0) {
-            // Map the photon features to our format
-            const mappedData = data.features.map((f: any) => ({
-              display_name: `${f.properties.name || ''} ${f.properties.street || ''} ${f.properties.city || ''}`.trim() || 'Unknown Place',
-              lat: f.geometry.coordinates[1],
-              lon: f.geometry.coordinates[0]
-            }));
-            
-            // Also automatically fit map to show search suggestions
-            const coords = mappedData.map((d: any) => ({ latitude: parseFloat(d.lat), longitude: parseFloat(d.lon) }));
-            mapRef.current?.fitToCoordinates([...coords, rootLoc], {
-              edgePadding: { top: 50, right: 50, bottom: 400, left: 50 },
-              animated: true
-            });
-
-            setSearchResults(mappedData);
-          } else {
-            setSearchResults([]);
-          }
-        } catch (e) {
-          console.log('Search Error:', e);
-        }
-      }, 500); // Debounce typing by half a second
-    } else {
-      setSearchResults([]);
-      setActiveSearchType(null);
-    }
-  };
-
-  const handleSelectAutocomplete = (item: any) => {
-    const coords = { latitude: parseFloat(item.lat), longitude: parseFloat(item.lon) };
-    const name = item.display_name.split(',')[0];
-    
-    let latestSource = sourceLocation || (location ? {latitude: location.coords.latitude, longitude: location.coords.longitude} : { latitude: 12.9141, longitude: 74.8560 });
-    let latestDest = destination;
-
-    if (activeSearchType === 'source') {
-      setStartText(name);
-      setSourceLocation(coords);
-      latestSource = coords;
-    } else {
-      setDestText(name);
-      setDestination(coords);
-      latestDest = coords;
-    }
-    
-    setSearchResults([]);
-    setActiveSearchType(null);
-
-    mapRef.current?.fitToCoordinates([latestSource, latestDest], {
-      edgePadding: { top: 100, right: 100, bottom: 400, left: 100 },
-      animated: true,
-    });
-    
-    fetchRoute(latestSource, latestDest);
-  };
-  
-  const handleMyLocation = () => {
-    setStartText("My Location");
-    setSourceLocation(null);
-    if (location) {
-       const loc = { latitude: location.coords.latitude, longitude: location.coords.longitude };
-       fetchRoute(loc, destination);
-       mapRef.current?.animateToRegion({
-         latitude: loc.latitude,
-         longitude: loc.longitude,
-         latitudeDelta: 0.015,
-         longitudeDelta: 0.012,
-       });
-    }
-  };
-
   useEffect(() => {
     let subscription: Location.LocationSubscription | null = null;
-
     (async () => {
       let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        console.log('Permission to access location was denied');
-        return;
-      }
-
+      if (status !== 'granted') return;
       let currentLocation = await Location.getCurrentPositionAsync({});
       setLocation(currentLocation);
-
       subscription = await Location.watchPositionAsync(
-        {
-          accuracy: Location.Accuracy.High,
-          timeInterval: 2000,
-          distanceInterval: 1,
-        },
-        (newLocation) => {
-          setLocation(newLocation);
-        }
+        { accuracy: Location.Accuracy.High, timeInterval: 1000, distanceInterval: 1 },
+        (newLoc) => setLocation(newLoc)
       );
     })();
-
-    return () => {
-      if (subscription) {
-        subscription.remove();
-      }
-    };
+    return () => subscription?.remove();
   }, []);
 
-  // Fetch initial route 
   useEffect(() => {
     fetchRoute({ latitude: 12.9141, longitude: 74.8560 }, initialDestLocation);
   }, []);
 
+  // ── Global Cloud Sync ──────────────────────────────────────────────────────
   useEffect(() => {
-    if (process.env.NODE_ENV === 'test') {
-      return;
-    }
-
-    let mounted = true;
-
-    const loadModel = async () => {
-      const result = await loadBundledTfliteModel();
-      if (!mounted) return;
-
-      setTfliteStatus(result.state);
-      setTfliteMessage(result.message);
-    };
-
-    loadModel();
-
-    return () => {
-      mounted = false;
-    };
+    const unsubscribe = listenForGlobalPotholes((data) => {
+      setPotholes(data);
+    });
+    return () => unsubscribe();
   }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    loadBundledTfliteModel().then(result => {
+      if (!mounted) return;
+      if (result.state === 'loaded' && result.model) tfliteModelRef.current = result.model;
+    });
+    return () => { mounted = false; };
+  }, []);
+
+  // ── Sensor Inference Loop ──────────────────────────────────────────────────
+  const handleSensorData = useCallback((accel: any, gyro: any) => {
+    const window = sensorWindowRef.current;
+    window.push([accel.x, accel.y, accel.z, gyro.x, gyro.y, gyro.z]);
+    if (window.length > MODEL_CONFIG.WINDOW_SIZE) window.shift();
+  }, []);
+
+  useEffect(() => {
+    let accelSub: any, gyroSub: any;
+    let latestAccel = { x: 0, y: 0, z: 9.81 }, latestGyro = { x: 0, y: 0, z: 0 };
+    if (isSensorActive) {
+      Accelerometer.setUpdateInterval(10);
+      Gyroscope.setUpdateInterval(10);
+      accelSub = Accelerometer.addListener(data => { latestAccel = data; handleSensorData(latestAccel, latestGyro); });
+      gyroSub = Gyroscope.addListener(data => { latestGyro = data; });
+    } else {
+      sensorWindowRef.current = [];
+    }
+    return () => { accelSub?.remove(); gyroSub?.remove(); };
+  }, [isSensorActive, handleSensorData]);
+
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval>;
+    if (isSensorActive && tfliteModelRef.current && location) {
+      interval = setInterval(() => {
+        const window = sensorWindowRef.current;
+        if (window.length < MODEL_CONFIG.WINDOW_SIZE) return;
+        
+        const speedKmh = location.coords.speed ? Math.max(0, location.coords.speed * 3.6) : 0;
+        const result = runPotholeInference(tfliteModelRef.current, window, speedKmh);
+        
+        if (result) {
+          const now = Date.now();
+          
+          if (result.isPothole) {
+            // Found a pothole!
+            if (now - lastDetectionTimeRef.current > 2000) {
+              lastDetectionTimeRef.current = now;
+              const newPothole: GlobalPothole = {
+                id: now.toString(),
+                latitude: location.coords.latitude,
+                longitude: location.coords.longitude,
+                severity: result.severity,
+                confidence: result.confidence,
+                timestamp: now,
+              };
+              syncPothole(newPothole); // Upload to Cloud
+              setDetectionCount(p => p + 1);
+            }
+          } else {
+            // Road is smooth. Auto-Healing Logic:
+            // Are we currently driving directly over a known pothole from the cloud?
+            potholes.forEach(p => {
+              const dist = getDistance(location.coords.latitude, location.coords.longitude, p.latitude, p.longitude);
+              if (dist < 15) { // Within 15 meters
+                // We passed over it and no anomaly was detected! It must be fixed.
+                removeFixedPothole(p.id);
+                setNotification(`✅ Hazard Resolved: Map Updated for everyone`);
+                if (isVoiceEnabled) {
+                  Speech.speak("Hazard resolved. Map updated.", { rate: 1.1 });
+                }
+                setTimeout(() => setNotification(null), 4000);
+              }
+            });
+          }
+        }
+      }, 500);
+    }
+    return () => clearInterval(interval);
+  }, [isSensorActive, location]);
+
+  // ── Nearest Pothole Calculation ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!location || potholes.length === 0) return;
+    let minDistance = Infinity;
+    let closestId: string | null = null;
+    potholes.forEach(p => {
+      const dist = getDistance(location.coords.latitude, location.coords.longitude, p.latitude, p.longitude);
+      if (dist < minDistance && dist > 5) {
+        minDistance = dist; // Ignore ones we are currently on top of (<5m)
+        closestId = p.id;
+      }
+    });
+    setClosestDistance(minDistance === Infinity ? null : minDistance);
+
+    // Dynamic Warning Distance based on speed
+    // 120 km/h = 33.3 m/s. 200m warning = 6 seconds to react.
+    const warningDistance = speedKmh > 80 ? 250 : 100;
+
+    // TTS Voice Alerts
+    if (isVoiceEnabled && minDistance < warningDistance && closestId && closestId !== lastWarnedPotholeId) {
+      Speech.speak("Warning. Hazard detected ahead.", { rate: 1.1 });
+      setLastWarnedPotholeId(closestId);
+    }
+  }, [location, potholes, isVoiceEnabled, lastWarnedPotholeId]);
 
   const currLocation = location 
     ? { latitude: location.coords.latitude, longitude: location.coords.longitude } 
-    : { latitude: 12.9141, longitude: 74.8560 }; // Default to Mangalore
+    : { latitude: 12.9141, longitude: 74.8560 };
+    
+  const speedKmh = location?.coords.speed ? Math.round(location.coords.speed * 3.6) : 0;
 
-  const activeSource = sourceLocation || currLocation;
-
-  // YOLO Computer Vision Detection Integration
-  useEffect(() => {
-    let interval: ReturnType<typeof setInterval>;
-    if (isCameraActive && location) {
-      interval = setInterval(async () => {
-        if (cameraRef.current) {
-          try {
-            // ** YOLO INTEGRATION ARCHITECTURE **
-            // To run the REAL real-time tracking YOLO model:
-            // 1. Take a frame image:
-            // const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.2 });
-            // 2. Send the image to your Python FastAPI / Flask Backend running YOLO:
-            // const response = await fetch('http://YOUR_LOCAL_IP:5000/detect', { method: 'POST', body: photo.base64 });
-            // const inferences = await response.json();
-            
-            // --- SIMULATING BACKEND YOLO MOCK FOR VISUALIZATION ---
-            if (Math.random() > 0.85) { // 15% chance to spot one in the frame
-              const levels = ['low', 'medium', 'high'] as const;
-              const severity = levels[Math.floor(Math.random() * levels.length)];
-              
-              let yoloColor = '#FFB300'; // Amber (low)
-              if (severity === 'medium') yoloColor = '#FF5252'; // Light Red (Medium)
-              if (severity === 'high') yoloColor = '#D50000'; // Deep Crimson (High)
-
-              const yoloDetection = {
-                class: `pothole - ${severity}`,
-                confidence: (0.8 + Math.random() * 0.19).toFixed(2), 
-                color: yoloColor,
-                box: { x: Math.random() * 200 + 50, y: Math.random() * 400 + 100, w: 100 + Math.random()*50, h: 50 + Math.random()*30 }
-              };
-              
-              setBoundingBoxes([yoloDetection]);
-              
-              // Register exact GPS of accurate structural detection
-              const newPothole = {
-                id: Date.now().toString(),
-                latitude: location.coords.latitude,
-                longitude: location.coords.longitude,
-                severity: severity
-              };
-              setPotholes(prev => [...prev, newPothole]);
-              
-              // Remove bounding box visual after 1 second
-              setTimeout(() => setBoundingBoxes([]), 1500);
-            }
-          } catch (e) {
-             console.log("YOLO Inference Error:", e);
-          }
-        }
-      }, 1000); // Process frame 1x/sec
-    } else {
-      setBoundingBoxes([]);
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [isCameraActive, location]);
+  // Smart Warning Logic
+  const getWarningState = () => {
+    const warningDistance = speedKmh > 80 ? 250 : 100;
+    if (!closestDistance) return { color: '#00E676', text: 'Clear Route', bg: 'rgba(0, 230, 118, 0.15)' };
+    if (closestDistance < 30) return { color: '#FF3D00', text: 'POTHOLE IMMINENT!', bg: 'rgba(255, 61, 0, 0.25)' };
+    if (closestDistance < warningDistance) return { color: '#FF9100', text: 'Approaching Hazard', bg: 'rgba(255, 145, 0, 0.2)' };
+    if (closestDistance < 300) return { color: '#FFEA00', text: 'Hazard Ahead', bg: 'rgba(255, 234, 0, 0.15)' };
+    return { color: '#00E676', text: 'Clear Route', bg: 'rgba(0, 230, 118, 0.15)' };
+  };
+  const warning = getWarningState();
 
   const handleStartNavigation = () => {
     setIsNavigating(true);
-    if (!cameraPermission?.granted) {
-      requestCameraPermission();
-    }
-    setIsCameraActive(true); // Auto-start YOLO inference in background/PiP
-
-    if (location) {
-       mapRef.current?.animateCamera({
-          center: { latitude: location.coords.latitude, longitude: location.coords.longitude },
-          pitch: 60, // 3D tilt
-          heading: location.coords.heading || 0,
-          zoom: 18,
-          altitude: 100
-       }, { duration: 1500 });
-    }
-  };
-
-  const handleStopNavigation = () => {
-    setIsNavigating(false);
-    setIsCameraActive(false);
+    setIsSensorActive(true);
     mapRef.current?.animateCamera({
-       pitch: 0,
-       heading: 0,
-       zoom: 14,
-    });
+      center: currLocation,
+      pitch: 60,
+      heading: location?.coords.heading || 0,
+      zoom: 18,
+      altitude: 50
+    }, { duration: 1500 });
   };
 
-  // Bottom Sheet references and variables
-
+  const handleToggleDashcam = async () => {
+    if (!cameraPermission?.granted) {
+      const { status } = await requestCameraPermission();
+      if (status !== 'granted') return;
+    }
+    setIsDashcamMode(prev => !prev);
+  };
 
   return (
     <GestureHandlerRootView style={styles.container}>
       <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
 
-      {/* Map View */}
-      <MapView
-        ref={mapRef}
-        provider={PROVIDER_GOOGLE}
-        style={styles.map}
-        customMapStyle={darkMapStyle}
-        showsUserLocation={true}
-        showsMyLocationButton={true}
-        showsCompass={true}
-        initialRegion={{
-          latitude: currLocation.latitude,
-          longitude: currLocation.longitude,
-          latitudeDelta: 0.015,
-          longitudeDelta: 0.012,
-        }}
-      >
-        {/* Route Line */}
+      {isDashcamMode && cameraPermission?.granted ? (
+        <CameraView style={StyleSheet.absoluteFillObject} facing="back" />
+      ) : (
+        <MapView
+          ref={mapRef}
+          provider={PROVIDER_GOOGLE}
+          style={styles.map}
+          customMapStyle={darkMapStyle}
+          showsUserLocation={false} 
+          showsMyLocationButton={false}
+          showsCompass={false}
+          pitchEnabled={true}
+          initialRegion={{ ...currLocation, latitudeDelta: 0.015, longitudeDelta: 0.012 }}
+        >
+          {/* Purple Route Line */}
         <Polyline
-          coordinates={routeCoords.length > 0 ? routeCoords : [activeSource, destination]}
-          strokeColor="#6B4DFF" // Vivid purple
-          strokeWidth={4}
+          coordinates={routeCoords.length > 0 ? routeCoords : [currLocation, initialDestLocation]}
+          strokeColor="#8B5CF6"
+          strokeWidth={6}
+          geodesic={true}
         />
 
-        {/* Custom Source Marker if typed location */}
-        {sourceLocation && (
-          <Marker coordinate={sourceLocation}>
-            <View style={styles.currLocationRing}>
-              <View style={styles.currLocationCenter}>
-                <Icon name="navigation" size={20} color="#E040FB" style={{ transform: [{ rotate: '45deg' }] }} />
-              </View>
-            </View>
-          </Marker>
-        )}
+        {/* 3D Car Icon (Current Location) */}
+        <Marker coordinate={currLocation} anchor={{x: 0.5, y: 0.5}}>
+          <View style={[styles.carWrapper, { transform: [{ rotate: `${location?.coords.heading || 0}deg` }] }]}>
+            <Icon name="car-sports" size={36} color="#00E676" />
+          </View>
+        </Marker>
 
-        {/* Detected Potholes Markers */}
-        {potholes.map(pothole => {
-          let bgColor = '#FFB300';
-          let size = 16;
-          
-          if (pothole.severity === 'medium') {
-             bgColor = '#FF5252';
-             size = 20;
-          } else if (pothole.severity === 'high') {
-             bgColor = '#D50000';
-             size = 26;
-          }
-
-          return (
-            <Marker key={pothole.id} coordinate={{ latitude: pothole.latitude, longitude: pothole.longitude }}>
-              <View style={[styles.potholeMarker, { backgroundColor: bgColor, width: size * 1.8, height: size * 1.8, borderRadius: size * 0.9 }]}>
-                <Icon name={pothole.severity === 'high' ? "alert-octagon" : "alert"} size={size} color="#FFF" />
-              </View>
-            </Marker>
-          );
-        })}
-
-        {/* Live Search Suggestion Pins */}
-        {activeSearchType && searchResults.map((item, idx) => (
-          <Marker 
-            key={`search-${idx}`} 
-            coordinate={{ latitude: parseFloat(item.lat), longitude: parseFloat(item.lon) }}
-            onPress={() => handleSelectAutocomplete(item)}
-          >
-            <View style={styles.searchPinRing}>
-              <Icon name="map-marker-star" size={24} color="#FFCA28" />
+        {/* Pothole Markers */}
+        {potholes.map(pothole => (
+          <Marker key={pothole.id} coordinate={{ latitude: pothole.latitude, longitude: pothole.longitude }}>
+            <View style={styles.potholeAura}>
+              <View style={styles.potholeCore} />
             </View>
           </Marker>
         ))}
-
-        {/* Current Location now handled natively by showsUserLocation={true} */}
-
-        {/* Destination Marker */}
-        <Marker coordinate={destination}>
-          <View style={styles.destLocationRing}>
-            <View style={styles.destLocationCenter} />
-          </View>
-        </Marker>
-      </MapView>
-
-      {/* Top Navigation Bar Overlay */}
-      <SafeAreaView style={styles.headerContainer} pointerEvents="box-none">
-        
-        {/* Only show Search form if NOT navigating */}
-        {!isNavigating && (
-          <View style={styles.searchCard}>
-            <View style={styles.modelStatusRow}>
-              <View style={[styles.modelStatusDot, tfliteStatus === 'loaded' ? styles.modelLoaded : tfliteStatus === 'loading' ? styles.modelLoading : styles.modelUnavailable]} />
-              <Text style={styles.modelStatusText} numberOfLines={2}>
-                {tfliteStatus === 'loaded'
-                  ? 'TFLite model ready for native inference.'
-                  : tfliteMessage}
-              </Text>
-            </View>
-            <View style={styles.searchInputRow}>
-              <Icon name="circle-double" size={16} color="#6B4DFF" style={styles.searchIcon} />
-              <TextInput 
-                style={styles.searchInput} 
-                placeholder="Choose starting point" 
-                placeholderTextColor="#888"
-                value={startText}
-                onChangeText={(text) => handleSearch(text, 'source')}
-              />
-              <TouchableOpacity onPress={handleMyLocation}>
-                <Icon name="crosshairs-gps" size={20} color="#888" />
-              </TouchableOpacity>
-            </View>
-            <View style={styles.searchDivider} />
-            <View style={styles.searchInputRow}>
-              <Icon name="map-marker" size={16} color="#FF3D00" style={styles.searchIcon} />
-              <TextInput 
-                style={styles.searchInput} 
-                placeholder="Choose destination" 
-                placeholderTextColor="#888"
-                value={destText}
-                onChangeText={(text) => handleSearch(text, 'dest')}
-              />
-            </View>
-
-            {searchResults.length > 0 && activeSearchType && (
-              <View style={styles.autocompleteContainer}>
-                {searchResults.map((res: any, idx: number) => (
-                  <TouchableOpacity key={idx} style={styles.autocompleteRow} onPress={() => handleSelectAutocomplete(res)}>
-                    <Icon name="map-marker-outline" size={20} color="#888" />
-                    <Text style={styles.autocompleteText} numberOfLines={1}>{res.display_name}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            )}
-
-          </View>
-        )}
-
-        {/* Dynamic Navigation Instructions Card */}
-        {isNavigating && routeDetails && routeCoords.length > 0 && (
-          <View style={styles.instructionCard}>
-            <TouchableOpacity style={styles.instructionCloseButton} onPress={handleStopNavigation}>
-              <Icon name="close" size={24} color="#FFF" />
-            </TouchableOpacity>
-            <View style={styles.instructionRowMain}>
-              <Icon name={getManeuverIcon(routeDetails.nextStep?.maneuver?.modifier || '')} size={42} color="#00E676" />
-              <View style={styles.instructionTextContainer}>
-                <Text style={styles.instructionNextStop} numberOfLines={1}>
-                  {routeDetails.nextStep?.name || 'Proceed on route'}
-                </Text>
-                <Text style={styles.instructionSub} numberOfLines={1}>toward {destText}</Text>
-              </View>
-              <View style={styles.metricsContainer}>
-                <Text style={styles.distanceMetric}>{formatDistance(routeDetails.nextStep?.distance || 0)}</Text>
-                <Text style={styles.timeMetric}>{Math.max(1, Math.round(routeDetails.durationS / 60))} min</Text>
-              </View>
-            </View>
-
-            {routeDetails.followingStep && routeDetails.followingStep.name && (
-              <View style={styles.secondaryInstructions}>
-                <View style={styles.instructionStep}>
-                  <Icon name={getManeuverIcon(routeDetails.followingStep.maneuver?.modifier || '')} size={20} color="#888" />
-                  <View style={styles.stepTextContainer}>
-                    <Text style={styles.stepDistance}>Then in {formatDistance(routeDetails.followingStep.distance)}</Text>
-                    <Text style={styles.stepLocation}>{routeDetails.followingStep.name || 'continue'}</Text>
-                  </View>
-                </View>
-              </View>
-            )}
-
-            <View style={styles.cardPullIndicator} />
-          </View>
-        )}
-
-        {/* Floating Icons (Pothole eye icon and compass) */}
-        <View style={styles.floatingIconsRight}>
-          <TouchableOpacity 
-            style={[styles.floatingIconBg, styles.purpleBg]}
-            onPress={() => {
-              if (!cameraPermission?.granted) {
-                requestCameraPermission();
-              }
-              setIsCameraActive(!isCameraActive);
-            }}
-          >
-            <Icon name="eye-outline" size={24} color="#FFF" />
-          </TouchableOpacity>
-          <TouchableOpacity 
-            style={[styles.floatingIconBg, styles.redBg]}
-            onPress={() => {
-              if (location) {
-                mapRef.current?.animateCamera({
-                  center: { latitude: location.coords.latitude, longitude: location.coords.longitude },
-                  heading: location.coords.heading || 0,
-                  pitch: isNavigating ? 60 : 0,
-                  zoom: 18,
-                });
-              }
-            }}
-          >
-            <Icon name="compass-outline" size={24} color="#FFF" />
-          </TouchableOpacity>
-        </View>
-
-        {/* Speed Indicator */}
-        <View style={styles.speedIndicator}>
-          <Icon name="near-me" size={20} color="#FFF" style={[styles.speedIcon, { transform: [{ rotate: '45deg' }] }]} />
-          <Text style={styles.speedNumber}>
-            {location?.coords.speed ? Math.max(0, Math.round(location.coords.speed * 2.23694)) : 0}
-          </Text>
-          <Text style={styles.speedUnit}>mph</Text>
-        </View>
-      </SafeAreaView>
-
-
-      {/* Bottom Start Panel */}
-      {!isNavigating && routeDetails && (
-        <View style={styles.bottomStartCard}>
-          <View style={styles.bottomStartInfo}>
-            <Text style={styles.bottomStartTime}>{Math.max(1, Math.round(routeDetails.durationS / 60))} min</Text>
-            <Text style={styles.bottomStartDistance}>({formatDistance(routeDetails.distanceMs)})</Text>
-          </View>
-          <TouchableOpacity style={styles.startButton} onPress={handleStartNavigation}>
-            <Icon name="navigation" size={20} color="#FFF" style={{marginRight: 8}} />
-            <Text style={styles.startButtonText}>Start</Text>
-          </TouchableOpacity>
-        </View>
+        </MapView>
       )}
 
-      {/* Floating Dashcam PiP for YOLO Detection (Replaces Full Screen) */}
-      {isNavigating && isCameraActive && cameraPermission?.granted && (
-        <View style={styles.floatingCameraWrapper}>
-          <CameraView ref={cameraRef} style={styles.floatingCamera} facing="back">
-            <View style={styles.pipOverlay}>
-              <View style={styles.pipHeader}>
-                <Text style={styles.pipText}>YOLO AI</Text>
-              </View>
-              
-              {/* YOLO Bounding Box Overlay for PiP */}
-              {boundingBoxes.map((item, idx) => (
-                <View key={`yolo-box-${idx}`} style={{
-                  position: 'absolute',
-                  left: item.box.x * 0.35, // Adjusting box coordinates for PiP scale
-                  top: item.box.y * 0.25,
-                  width: item.box.w * 0.4,
-                  height: item.box.h * 0.4,
-                  borderWidth: 2,
-                  borderColor: item.color,
-                  backgroundColor: `${item.color}33`, // 33 for 20% alpha hex
-                  zIndex: 999,
-                }} />
-              ))}
+      {/* ── Top Floating Info Chip ──────────────────────────────────────────── */}
+      <View style={styles.topChipContainer} pointerEvents="none">
+        <BlurView intensity={80} tint="dark" style={styles.topChip}>
+          <Icon name="cloud-sync" size={18} color="#8B5CF6" />
+          <Text style={styles.topChipText}>{potholes.length} Global Hazards Ahead</Text>
+        </BlurView>
+        
+        {/* Auto-Healing Notification Banner */}
+        {notification && (
+          <Animated.View style={styles.notificationBanner}>
+            <Text style={styles.notificationText}>{notification}</Text>
+          </Animated.View>
+        )}
+      </View>
+
+      {/* ── Mid Info Strip & Smart Warning (Automotive Dashboard Layout) ───── */}
+      {isNavigating ? (
+        <View style={styles.dashboardOverlay}>
+          
+          {/* Smart Warning Bar */}
+          <View style={[styles.warningBar, { backgroundColor: warning.bg, borderColor: warning.color }]}>
+            <Icon name={closestDistance && closestDistance < 100 ? "alert-octagon" : "shield-check"} size={24} color={warning.color} />
+            <Text style={[styles.warningText, { color: warning.color }]}>
+              {warning.text} {closestDistance ? `(${Math.round(closestDistance)}m)` : ''}
+            </Text>
+          </View>
+
+          {/* Glass Telemetry Strip */}
+          <BlurView intensity={90} tint="dark" style={styles.telemetryStrip}>
+            <View style={styles.telemetryItem}>
+              <Icon name="speedometer" size={20} color="#AAA" />
+              <Text style={styles.telemetryValue}>{speedKmh}</Text>
+              <Text style={styles.telemetryLabel}>km/h</Text>
             </View>
-          </CameraView>
+            <View style={styles.telemetryDivider} />
+            <View style={styles.telemetryItem}>
+              <Icon name="crosshairs-gps" size={20} color={location?.coords.accuracy && location.coords.accuracy < 20 ? "#00E676" : "#FFCA28"} />
+              <Text style={styles.telemetryValue}>GPS</Text>
+              <Text style={styles.telemetryLabel}>Signal</Text>
+            </View>
+            <View style={styles.telemetryDivider} />
+            <View style={styles.telemetryItem}>
+              <Icon name="radar" size={20} color="#8B5CF6" />
+              <Text style={styles.telemetryValue}>{detectionCount}</Text>
+              <Text style={styles.telemetryLabel}>New</Text>
+            </View>
+          </BlurView>
+
+          {/* Quick Controls */}
+          <View style={styles.quickControlsRow}>
+            <TouchableOpacity style={styles.controlBtn} onPress={handleToggleDashcam}>
+              <Icon name={isDashcamMode ? "map-outline" : "camera-outline"} size={24} color={isDashcamMode ? "#00E676" : "#FFF"} />
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.controlBtnClose} onPress={() => { setIsNavigating(false); setIsSensorActive(false); }}>
+              <Icon name="close" size={28} color="#FFF" />
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.controlBtn} onPress={() => setIsVoiceEnabled(!isVoiceEnabled)}>
+              <Icon name={isVoiceEnabled ? "volume-high" : "volume-off"} size={24} color={isVoiceEnabled ? "#00E676" : "#888"} />
+            </TouchableOpacity>
+          </View>
+
+        </View>
+      ) : (
+        <View style={styles.startPanel}>
+          <View style={styles.startPanelInner}>
+            <Text style={styles.startTitle}>RoadStrix Navigation</Text>
+            <Text style={styles.startSub}>Suspension Telemetry Ready</Text>
+            <TouchableOpacity style={styles.startBtn} onPress={handleStartNavigation}>
+              <Icon name="steering" size={24} color="#FFF" style={{marginRight: 8}} />
+              <Text style={styles.startBtnText}>Start Drive</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       )}
 
@@ -591,584 +370,122 @@ const App = () => {
 };
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#121212',
+  container: { flex: 1, backgroundColor: '#0F0F14' },
+  map: { ...StyleSheet.absoluteFillObject },
+  
+  // Custom Map Markers
+  carWrapper: {
+    width: 60, height: 60,
+    justifyContent: 'center', alignItems: 'center',
+    shadowColor: '#00E676', shadowOpacity: 0.5, shadowRadius: 10, elevation: 8,
   },
-  map: {
-    ...StyleSheet.absoluteFillObject,
-  },
-  headerContainer: {
-    ...StyleSheet.absoluteFillObject,
-    paddingTop: 40,
-    paddingHorizontal: 16,
-  },
-  headerRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 20,
-  },
-  searchCard: {
-    backgroundColor: '#222030',
+  potholeAura: {
+    width: 32, height: 32,
     borderRadius: 16,
-    padding: 12,
-    shadowColor: '#000',
-    shadowOpacity: 0.5,
-    shadowRadius: 10,
-    elevation: 8,
-    marginBottom: 20,
-  },
-  modelStatusRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    marginBottom: 12,
-    paddingBottom: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255,255,255,0.08)',
-  },
-  modelStatusDot: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    marginTop: 4,
-    marginRight: 10,
-  },
-  modelLoaded: {
-    backgroundColor: '#00E676',
-  },
-  modelLoading: {
-    backgroundColor: '#FFCA28',
-  },
-  modelUnavailable: {
-    backgroundColor: '#FF7043',
-  },
-  modelStatusText: {
-    flex: 1,
-    color: '#D7D5E2',
-    fontSize: 13,
-    lineHeight: 18,
-  },
-  searchInputRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 8,
-  },
-  searchIcon: {
-    marginRight: 12,
-  },
-  searchInput: {
-    flex: 1,
-    color: '#FFF',
-    fontSize: 16,
-  },
-  searchDivider: {
-    height: 1,
-    backgroundColor: 'rgba(255,255,255,0.1)',
-    marginLeft: 28,
-  },
-  iconButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: 'rgba(255,255,255,0.1)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  headerTitle: {
-    color: '#FFF',
-    fontSize: 18,
-    fontWeight: 'bold',
-  },
-  instructionCard: {
-    backgroundColor: '#00C853', // High visibility modern Google Maps green
-    borderRadius: 24,
-    padding: 24,
-    shadowColor: '#000',
-    shadowOpacity: 0.5,
-    shadowRadius: 10,
-    elevation: 8,
-  },
-  instructionCloseButton: {
-    position: 'absolute',
-    top: 12,
-    right: 12,
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: 'rgba(0,0,0,0.2)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 10,
-  },
-  instructionRowMain: {
-    flexDirection: 'row',
-    alignItems: 'center',
-  },
-  instructionTextContainer: {
-    marginLeft: 16,
-    flex: 1,
-  },
-  instructionNextStop: {
-    color: '#FFF',
-    fontSize: 18,
-    fontWeight: '600',
-  },
-  instructionSub: {
-    color: '#AAA',
-    fontSize: 12,
-    marginTop: 4,
-  },
-  metricsContainer: {
-    alignItems: 'flex-end',
-    justifyContent: 'center',
-    marginLeft: 10,
-  },
-  distanceMetric: {
-    color: '#00E676',
-    fontSize: 22,
-    fontWeight: 'bold',
-  },
-  timeMetric: {
-    color: '#FFF',
-    fontSize: 14,
-    fontWeight: '600',
-    marginTop: 2,
-  },
-  secondaryInstructions: {
-    marginTop: 20,
-  },
-  instructionStep: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginTop: 12,
-  },
-  stepTextContainer: {
-    marginLeft: 16,
-  },
-  stepDistance: {
-    color: '#AAA',
-    fontSize: 12,
-  },
-  stepLocation: {
-    color: '#FFF',
-    fontSize: 14,
-    fontWeight: '500',
-  },
-  cardPullIndicator: {
-    width: 40,
-    height: 4,
-    backgroundColor: 'rgba(255,255,255,0.2)',
-    borderRadius: 2,
-    alignSelf: 'center',
-    marginTop: 16,
-  },
-  floatingIconsRight: {
-    position: 'absolute',
-    right: 16,
-    bottom: '40%',
-  },
-  floatingIconBg: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 16,
-    shadowColor: '#000',
-    shadowOpacity: 0.3,
-    shadowRadius: 5,
-    elevation: 5,
-  },
-  purpleBg: {
-    backgroundColor: '#6B4DFF',
-  },
-  redBg: {
-    backgroundColor: '#E53935',
-  },
-  speedIndicator: {
-    position: 'absolute',
-    left: 16,
-    bottom: '40%',
-    backgroundColor: '#00C853',
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 24,
-  },
-  speedNumber: {
-    color: '#FFF',
-    fontSize: 20,
-    fontWeight: 'bold',
-  },
-  speedUnit: {
-    color: '#FFF',
-    fontSize: 14,
-    marginLeft: 4,
-  },
-  speedIcon: {
-    marginRight: 4,
-  },
-  bottomStartCard: {
-    position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    backgroundColor: '#222030',
-    padding: 24,
-    paddingBottom: 40,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    borderTopWidth: 1,
-    borderTopColor: 'rgba(255,255,255,0.1)',
-  },
-  bottomStartInfo: {
-    flexDirection: 'row',
-    alignItems: 'baseline',
-  },
-  bottomStartTime: {
-    color: '#00E676',
-    fontSize: 28,
-    fontWeight: 'bold',
-  },
-  bottomStartDistance: {
-    color: '#AAA',
-    fontSize: 16,
-    marginLeft: 8,
-  },
-  startButton: {
-    backgroundColor: '#6B4DFF',
-    flexDirection: 'row',
-    paddingHorizontal: 32,
-    paddingVertical: 14,
-    borderRadius: 30,
-    alignItems: 'center',
-  },
-  startButtonText: {
-    color: '#FFF',
-    fontSize: 18,
-    fontWeight: 'bold',
-  },
-  floatingCameraWrapper: {
-    position: 'absolute',
-    left: 20,
-    bottom: 120,
-    width: 130,
-    height: 180,
-    borderRadius: 16,
-    overflow: 'hidden',
-    borderWidth: 2,
-    borderColor: '#00E676',
-    backgroundColor: '#000',
-    elevation: 10,
-  },
-  floatingCamera: {
-    flex: 1,
-  },
-  pipOverlay: {
-    ...StyleSheet.absoluteFillObject,
-  },
-  pipHeader: {
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    paddingVertical: 4,
-    alignItems: 'center',
-  },
-  pipText: {
-    color: '#00E676',
-    fontSize: 12,
-    fontWeight: 'bold',
-  },
-  currLocationRing: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-    backgroundColor: 'rgba(224, 64, 251, 0.2)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  currLocationCenter: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#FFF',
-    justifyContent: 'center',
-    alignItems: 'center',
-    shadowColor: '#E040FB',
-    shadowOpacity: 0.8,
-    shadowRadius: 8,
-    elevation: 5,
-  },
-  destLocationRing: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#00E676',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  destLocationCenter: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    backgroundColor: '#FFF',
-  },
-  bottomSheetHandleIndicator: {
-    backgroundColor: '#555',
-  },
-  bottomSheetBackground: {
-    backgroundColor: '#1E1B26',
-  },
-  sheetContent: {
-    paddingHorizontal: 24,
-    paddingBottom: 24,
-  },
-  carDetailsRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  carTitle: {
-    color: '#FFF',
-    fontSize: 22,
-    fontWeight: '600',
-    marginBottom: 8,
-  },
-  statusRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginTop: 4,
-  },
-  batteryText: {
-    color: '#4CAF50',
-    fontSize: 14,
-    fontWeight: 'bold',
-    marginLeft: 8,
-  },
-  timeText: {
-    color: '#AAA',
-    fontWeight: 'normal',
-  },
-  tempText: {
-    color: '#FFCA28',
-    fontSize: 14,
-    fontWeight: 'bold',
-    marginLeft: 8,
-  },
-  carImagePlaceholder: {
-    width: 120,
-    height: 80,
-    justifyContent: 'center',
-    alignItems: 'flex-end',
-  },
-  autoDriveRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginVertical: 24,
-  },
-  autoDriveLabel: {
-    color: '#FFF',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  preferencesButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(255,255,255,0.05)',
-    padding: 16,
-    borderRadius: 16,
-    marginBottom: 24,
-  },
-  prefTextContainer: {
-    marginLeft: 16,
-  },
-  prefTitle: {
-    color: '#FFF',
-    fontSize: 14,
-    fontWeight: '500',
-  },
-  prefSub: {
-    color: '#AAA',
-    fontSize: 12,
-    marginTop: 2,
-  },
-  stopButton: {
-    backgroundColor: '#E53935',
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 12,
-    borderRadius: 30,
-    position: 'relative',
-  },
-  stopIconCircle: {
-    position: 'absolute',
-    left: 8,
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: '#FFF',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  stopButtonText: {
-    color: '#FFF',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  cameraOverlay: {
-    flex: 1,
-    padding: 16,
-    justifyContent: 'space-between',
-    backgroundColor: 'rgba(0,0,0,0.3)',
-  },
-  cameraHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingTop: 10,
-  },
-  cameraTitle: {
-    color: '#FFF',
-    fontSize: 18,
-    fontWeight: 'bold',
-    textShadowColor: 'rgba(0,0,0,0.8)',
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 4,
-  },
-  iconButtonPlaceholder: {
-    width: 40,
-  },
-  potholeDetectionContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  potholeDetectionText: {
-    color: '#FFF',
-    fontSize: 24,
-    fontWeight: 'bold',
-    marginBottom: 40,
-    textShadowColor: 'rgba(0, 0, 0, 0.75)',
-    textShadowOffset: {width: 0, height: 2},
-    textShadowRadius: 8
-  },
-  scanBox: {
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  scanIcon: {
-    opacity: 0.8,
-  },
-  cameraBottomBar: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 20,
-    paddingHorizontal: 20,
-  },
-  speedIndicatorCamera: {
-    flexDirection: 'row',
-    alignItems: 'baseline',
-  },
-  speedNumberCamera: {
-    color: '#FFF',
-    fontSize: 48,
-    fontWeight: 'bold',
-    textShadowColor: 'rgba(0,0,0,0.8)',
-    textShadowOffset: { width: 0, height: 2 },
-    textShadowRadius: 8,
-  },
-  speedUnitCamera: {
-    color: '#FFF',
-    fontSize: 18,
-    marginLeft: 8,
-    textShadowColor: 'rgba(0,0,0,0.8)',
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 4,
-  },
-  recordingDotContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 16,
-  },
-  recordingDot: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    backgroundColor: '#E53935',
-    marginRight: 8,
-  },
-  recordingText: {
-    color: '#FFF',
-    fontWeight: 'bold',
-  },
-  potholeMarker: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: '#FF3D00',
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 2,
-    borderColor: '#FFF',
-    shadowColor: '#FF3D00',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.8,
-    shadowRadius: 4,
-    elevation: 5,
-  },
-  potholeBadge: {
     backgroundColor: 'rgba(255, 61, 0, 0.2)',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
+    justifyContent: 'center', alignItems: 'center',
+    borderWidth: 1, borderColor: 'rgba(255, 61, 0, 0.5)',
+  },
+  potholeCore: {
+    width: 12, height: 12,
+    borderRadius: 6,
+    backgroundColor: '#FF3D00',
+    shadowColor: '#FF3D00', shadowOpacity: 1, shadowRadius: 6, elevation: 5,
+  },
+
+  // Floating Info Chip
+  topChipContainer: {
+    position: 'absolute', top: 55, left: 0, right: 0,
+    alignItems: 'center', zIndex: 10,
+  },
+  topChip: {
+    flexDirection: 'row', alignItems: 'center',
+    paddingHorizontal: 20, paddingVertical: 10,
+    borderRadius: 24, overflow: 'hidden',
+    borderWidth: 1, borderColor: 'rgba(139, 92, 246, 0.3)',
+  },
+  topChipText: { color: '#FFF', fontSize: 14, fontWeight: '600', marginLeft: 8 },
+  notificationBanner: {
+    marginTop: 12,
+    backgroundColor: '#00E676',
+    paddingHorizontal: 20,
+    paddingVertical: 10,
     borderRadius: 20,
-    marginBottom: 40,
-    borderWidth: 1,
-    borderColor: '#FF3D00',
+    shadowColor: '#00E676', shadowOpacity: 0.5, shadowRadius: 10, elevation: 5,
   },
-  potholeBadgeText: {
-    color: '#FFF',
-    fontWeight: 'bold',
+  notificationText: { color: '#0F0F14', fontWeight: 'bold' },
+
+  // Dashboard Overlay
+  dashboardOverlay: {
+    position: 'absolute', bottom: 30, left: 20, right: 20,
+    zIndex: 10,
+    alignSelf: 'center',
+    width: '100%',
+    maxWidth: 600, // Perfect for car tablets
   },
-  autocompleteContainer: {
-    backgroundColor: '#222030',
-    borderBottomLeftRadius: 16,
-    borderBottomRightRadius: 16,
-    marginTop: -4, 
-    paddingTop: 16,
-    paddingBottom: 8,
-    borderTopWidth: 1,
-    borderTopColor: 'rgba(255,255,255,0.1)',
+  
+  // Smart Warning Bar
+  warningBar: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    paddingVertical: 14, paddingHorizontal: 20,
+    borderRadius: 16, borderWidth: 1,
+    marginBottom: 12,
   },
-  autocompleteRow: {
-    flexDirection: 'row',
+  warningText: { fontSize: 18, fontWeight: 'bold', marginLeft: 10 },
+
+  // Telemetry Strip
+  telemetryStrip: {
+    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    paddingVertical: 16, paddingHorizontal: 24,
+    borderRadius: 20, overflow: 'hidden',
+    borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)',
+    marginBottom: 20,
+  },
+  telemetryItem: { alignItems: 'center', flex: 1 },
+  telemetryValue: { color: '#FFF', fontSize: 20, fontWeight: 'bold', marginTop: 4 },
+  telemetryLabel: { color: '#888', fontSize: 11, fontWeight: '600', marginTop: 2, textTransform: 'uppercase' },
+  telemetryDivider: { width: 1, height: 40, backgroundColor: 'rgba(255,255,255,0.1)' },
+
+  // Quick Controls
+  quickControlsRow: {
+    flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center',
+  },
+  controlBtn: {
+    width: 56, height: 56, borderRadius: 28,
+    backgroundColor: 'rgba(30, 30, 40, 0.9)',
+    justifyContent: 'center', alignItems: 'center',
+    borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)',
+  },
+  controlBtnClose: {
+    width: 64, height: 64, borderRadius: 32,
+    backgroundColor: '#E53935',
+    justifyContent: 'center', alignItems: 'center',
+    shadowColor: '#E53935', shadowOpacity: 0.4, shadowRadius: 10, elevation: 8,
+  },
+
+  // Start Panel
+  startPanel: {
+    position: 'absolute', bottom: 0, left: 0, right: 0,
+    backgroundColor: 'rgba(15, 15, 20, 0.95)',
+    padding: 30, paddingBottom: 50,
+    borderTopLeftRadius: 32, borderTopRightRadius: 32,
+    borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.1)',
     alignItems: 'center',
-    padding: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255,255,255,0.05)',
   },
-  autocompleteText: {
-    color: '#FFF',
-    marginLeft: 12,
-    flex: 1,
-  },
-  searchPinRing: {
-    backgroundColor: 'rgba(255, 202, 40, 0.2)',
-    padding: 6,
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: '#FFCA28',
-    justifyContent: 'center',
+  startPanelInner: {
+    width: '100%',
+    maxWidth: 600,
     alignItems: 'center',
   },
+  startTitle: { color: '#FFF', fontSize: 24, fontWeight: 'bold', marginBottom: 4 },
+  startSub: { color: '#AAA', fontSize: 14, marginBottom: 24 },
+  startBtn: {
+    backgroundColor: '#8B5CF6',
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    width: '100%', paddingVertical: 18, borderRadius: 16,
+    shadowColor: '#8B5CF6', shadowOpacity: 0.4, shadowRadius: 12, elevation: 6,
+  },
+  startBtnText: { color: '#FFF', fontSize: 18, fontWeight: 'bold' },
 });
 
 export default App;

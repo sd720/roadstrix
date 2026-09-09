@@ -4,7 +4,19 @@
     "slug": "potholedetector",
     "version": "1.0.0",
     "plugins": [
-      "react-native-fast-tflite"
+      "react-native-fast-tflite",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow RoadStrix to access your camera for the AR Dashcam feature."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow RoadStrix to use your location to map hazards."
+        }
+      ]
     ],
     "assetBundlePatterns": [
       "**/*"
@@ -27,6 +39,11 @@
       "image": "./assets/logo.png",
       "resizeMode": "contain",
       "backgroundColor": "#121212"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "56125b77-1aa5-4fd3-a8fc-bfdf666a4752"
+      }
     }
   }
 }

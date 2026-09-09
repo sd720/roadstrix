@@ -1,0 +1,29 @@
+{
+  "mean": [
+    0.005251569207757711,
+    -0.00025258277310058475,
+    9.82555866241455,
+    -1.4262373952078633e-05,
+    0.0006450143409892917,
+    8.533670552424155e-06
+  ],
+  "std": [
+    0.312040239572525,
+    0.26456212997436523,
+    0.32394060492515564,
+    0.049975667148828506,
+    0.040099162608385086,
+    0.059930287301540375
+  ],
+  "window_size": 50,
+  "num_channels": 6,
+  "description": "Per-channel normalisation constants [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]",
+  "threshold_high_precision": 1.0686289072036743,
+  "threshold_high_recall": 0.9989140033721924,
+  "threshold_default": 1.0686289072036743,
+  "normal_mse_mean": 0.8646844625473022,
+  "normal_mse_std": 0.07653068006038666,
+  "pothole_mse_mean": 42.7546501159668,
+  "detection_rate": 1.0,
+  "separation_ratio": 49.445377349853516
+}
