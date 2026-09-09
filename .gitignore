@@ -22,6 +22,10 @@ DerivedData
 *.xcuserstate
 **/.xcode.env.local
 
+# Native directories (Expo Prebuild / CNG)
+/android/
+/ios/
+
 # Android/IntelliJ
 #
 build/

@@ -5,6 +5,7 @@
     "version": "1.0.0",
     "plugins": [
       "react-native-fast-tflite",
+      "expo-font",
       [
         "expo-camera",
         {
@@ -21,19 +22,19 @@
     "assetBundlePatterns": [
       "**/*"
     ],
-    "ios": {
-      "supportsTabletMode": true
-    },
     "android": {
       "permissions": [
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.CAMERA",
-        "android.permission.ACCESS_FINE_LOCATION",
-        "android.permission.ACCESS_COARSE_LOCATION",
-        "android.permission.CAMERA"
+        "android.permission.RECORD_AUDIO"
       ],
-      "package": "com.shriramkg.potholedetector"
+      "package": "com.shriramkg.potholedetector",
+      "config": {
+        "googleMaps": {
+          "apiKey": "AIzaSyD-PlaceholderRoadStrixKeyInit00"
+        }
+      }
     },
     "splash": {
       "image": "./assets/logo.png",
