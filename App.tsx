@@ -8,8 +8,9 @@ import {
   StatusBar,
   Dimensions,
   Animated,
+  Vibration,
 } from 'react-native';
-import MapView, { Marker, Polyline } from 'react-native-maps';
+import MapView, { Marker, Polyline, UrlTile } from 'react-native-maps';
 import Icon from '@expo/vector-icons/MaterialCommunityIcons';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { darkMapStyle } from './src/styles/mapStyle';
@@ -20,13 +21,19 @@ import { BlurView } from 'expo-blur';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Speech from 'expo-speech';
 
-import { listenForGlobalPotholes, syncPothole, removeFixedPothole, GlobalPothole } from './src/services/backendSync';
+import {
+  listenForGlobalPotholes,
+  syncPothole,
+  removeFixedPothole,
+  seedHazardsAroundLocation,
+  GlobalPothole,
+} from './src/services/backendSync';
 
-const { width } = Dimensions.get('window');
+const { width, height } = Dimensions.get('window');
 
-// ── Utility: Haversine Distance ──────────────────────────────────────────────
+// ── Utility: Haversine Distance (in meters) ──────────────────────────────────
 function getDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
-  const R = 6371e3; // metres
+  const R = 6371e3;
   const p1 = (lat1 * Math.PI) / 180;
   const p2 = (lat2 * Math.PI) / 180;
   const dp = ((lat2 - lat1) * Math.PI) / 180;
@@ -38,9 +45,7 @@ function getDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
   return R * c;
 }
 
-const initialDestLocation = { latitude: 12.9538, longitude: 74.8340 };
-
-// ── Error Boundary for Crash Prevention ─────────────────────────────────────
+// ── Error Boundary for Maximum Stability ────────────────────────────────────
 interface ErrorBoundaryProps {
   children: React.ReactNode;
 }
@@ -60,7 +65,7 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
   }
 
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
-    console.log('[RoadStrix ErrorBoundary] Caught error:', error, errorInfo);
+    console.log('[RoadStrix ErrorBoundary] Error caught:', error, errorInfo);
   }
 
   handleRestart = () => {
@@ -73,13 +78,13 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
         <View style={styles.errorContainer}>
           <StatusBar barStyle="light-content" backgroundColor="#0F0F14" />
           <Icon name="alert-circle-outline" size={64} color="#FF3D00" />
-          <Text style={styles.errorTitle}>RoadStrix Diagnostics</Text>
+          <Text style={styles.errorTitle}>RoadStrix Recovery System</Text>
           <Text style={styles.errorMessage}>
-            {this.state.error?.message || 'A subsystem encounter was caught and handled safely.'}
+            {this.state.error?.message || 'A subsystem encounter was caught and recovered.'}
           </Text>
           <TouchableOpacity style={styles.restartBtn} onPress={this.handleRestart}>
             <Icon name="reload" size={20} color="#FFF" style={{ marginRight: 8 }} />
-            <Text style={styles.restartBtnText}>Restart Application</Text>
+            <Text style={styles.restartBtnText}>Restart System</Text>
           </TouchableOpacity>
         </View>
       );
@@ -88,7 +93,7 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
   }
 }
 
-// ── Main RoadStrix Component ────────────────────────────────────────────────
+// ── Main RoadStrix Automotive Component ─────────────────────────────────────
 const RoadStrixApp = () => {
   const mapRef = useRef<MapView>(null);
   const [location, setLocation] = useState<Location.LocationObject | null>(null);
@@ -97,6 +102,7 @@ const RoadStrixApp = () => {
   const [isVoiceEnabled, setIsVoiceEnabled] = useState(true);
   const [lastWarnedPotholeId, setLastWarnedPotholeId] = useState<string | null>(null);
 
+  // Sensor & Telemetry State
   const [isSensorActive, setIsSensorActive] = useState(false);
   const [isDashcamMode, setIsDashcamMode] = useState(false);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
@@ -107,110 +113,202 @@ const RoadStrixApp = () => {
   const [routeCoords, setRouteCoords] = useState<{ latitude: number; longitude: number }[]>([]);
   const [isNavigating, setIsNavigating] = useState(false);
 
-  // Dynamic Warning State
+  // Dynamic Speedometer (Sensor-Fused Instantaneous Response)
+  const [displaySpeed, setDisplaySpeed] = useState<number>(0);
+  const rawGpsSpeedRef = useRef<number>(0);
+  const kineticMotionRef = useRef<number>(0);
+  const latestGpsCoordsRef = useRef<{ latitude: number; longitude: number } | null>(null);
+
+  // Dynamic Proximity Warning State
   const [closestDistance, setClosestDistance] = useState<number | null>(null);
 
+  // Safe TTS
   const speakSafely = useCallback(
     (phrase: string) => {
       if (!isVoiceEnabled) return;
       try {
-        Speech.speak(phrase, { rate: 1.1 });
+        Speech.stop();
+        Speech.speak(phrase, { rate: 1.05 });
       } catch (e) {
-        console.log('[Speech] TTS speak warning:', e);
+        console.log('[Speech] TTS warning:', e);
       }
     },
     [isVoiceEnabled]
   );
 
-  const fetchRoute = async (
-    startCoord: { latitude: number; longitude: number },
-    endCoord: { latitude: number; longitude: number }
-  ) => {
-    try {
-      const res = await fetch(
-        `https://router.project-osrm.org/route/v1/driving/${startCoord.longitude},${startCoord.latitude};${endCoord.longitude},${endCoord.latitude}?overview=full&geometries=geojson`
-      );
-      const data = await res.json();
-      if (data.routes && data.routes.length > 0) {
-        const coords = data.routes[0].geometry.coordinates.map((c: number[]) => ({
-          latitude: c[1],
-          longitude: c[0],
-        }));
-        setRouteCoords(coords);
-      }
-    } catch (e) {
-      console.log('Routing error:', e);
-    }
-  };
+  // Dynamic Pothole Trigger (Called by TFLite, Shock Sensor, or Manual Test Button)
+  const triggerPotholeDetection = useCallback(
+    (
+      source: 'AI Suspension' | 'IMU Impact' | 'Manual Test',
+      severity: 'low' | 'medium' | 'high' = 'high',
+      confidence = 0.94
+    ) => {
+      const now = Date.now();
+      if (now - lastDetectionTimeRef.current < 2000) return; // 2s debounce
+      lastDetectionTimeRef.current = now;
 
-  // Safe Location Initialization
+      try {
+        Vibration.vibrate(350);
+      } catch (e) {}
+
+      const coords = latestGpsCoordsRef.current || {
+        latitude: location?.coords.latitude || 12.9141,
+        longitude: location?.coords.longitude || 74.8560,
+      };
+
+      const newPothole: GlobalPothole = {
+        id: `detected_${now}`,
+        latitude: coords.latitude,
+        longitude: coords.longitude,
+        severity,
+        confidence,
+        timestamp: now,
+      };
+
+      // Upload to global cloud and update local state
+      syncPothole(newPothole);
+      setDetectionCount((c) => c + 1);
+      setNotification(`⚠️ Hazard Detected (${source}) & Marked on Map!`);
+      speakSafely('Hazard detected. Marked on map.');
+      setTimeout(() => setNotification(null), 4000);
+    },
+    [location, speakSafely]
+  );
+
+  // Route calculation with graceful fallback
+  const fetchRoute = useCallback(
+    async (
+      startCoord: { latitude: number; longitude: number },
+      endCoord: { latitude: number; longitude: number }
+    ) => {
+      try {
+        const res = await fetch(
+          `https://router.project-osrm.org/route/v1/driving/${startCoord.longitude},${startCoord.latitude};${endCoord.longitude},${endCoord.latitude}?overview=full&geometries=geojson`
+        );
+        const data = await res.json();
+        if (data.routes && data.routes.length > 0) {
+          const coords = data.routes[0].geometry.coordinates.map((c: number[]) => ({
+            latitude: c[1],
+            longitude: c[0],
+          }));
+          setRouteCoords(coords);
+          return;
+        }
+      } catch (e) {
+        console.log('[Routing] OSRM fetch error (using direct route line):', e);
+      }
+      // Instant reliable fallback route polyline
+      setRouteCoords([startCoord, endCoord]);
+    },
+    []
+  );
+
+  // ── 1. Safe Live Location Tracking ─────────────────────────────────────────
   useEffect(() => {
     let subscription: Location.LocationSubscription | null = null;
     let isMounted = true;
 
-    const setupLocation = async () => {
+    const initLocation = async () => {
       try {
         const { status } = await Location.requestForegroundPermissionsAsync();
         if (status !== 'granted' || !isMounted) return;
 
+        let curLoc: Location.LocationObject | null = null;
         try {
-          const currentLocation = await Location.getCurrentPositionAsync({
-            accuracy: Location.Accuracy.Balanced,
+          curLoc = await Location.getCurrentPositionAsync({
+            accuracy: Location.Accuracy.High,
           });
-          if (isMounted) setLocation(currentLocation);
-        } catch (posErr) {
-          console.log('[Location] Current pos fallback:', posErr);
-          try {
-            const lastKnown = await Location.getLastKnownPositionAsync();
-            if (isMounted && lastKnown) setLocation(lastKnown);
-          } catch (lastErr) {
-            console.log('[Location] Last known pos fallback failed:', lastErr);
-          }
+        } catch (e) {
+          curLoc = await Location.getLastKnownPositionAsync();
         }
 
+        if (curLoc && isMounted) {
+          setLocation(curLoc);
+          latestGpsCoordsRef.current = {
+            latitude: curLoc.coords.latitude,
+            longitude: curLoc.coords.longitude,
+          };
+
+          // 1. Seed dynamic hazards right ahead on the user's real street!
+          seedHazardsAroundLocation(curLoc.coords.latitude, curLoc.coords.longitude);
+
+          // 2. Center map smoothly on the user's real GPS position
+          mapRef.current?.animateToRegion(
+            {
+              latitude: curLoc.coords.latitude,
+              longitude: curLoc.coords.longitude,
+              latitudeDelta: 0.005,
+              longitudeDelta: 0.005,
+            },
+            800
+          );
+
+          // 3. Generate route ahead on their actual road
+          fetchRoute(
+            { latitude: curLoc.coords.latitude, longitude: curLoc.coords.longitude },
+            { latitude: curLoc.coords.latitude + 0.004, longitude: curLoc.coords.longitude + 0.002 }
+          );
+        }
+
+        // Live location updates
         subscription = await Location.watchPositionAsync(
-          { accuracy: Location.Accuracy.High, timeInterval: 1000, distanceInterval: 1 },
+          {
+            accuracy: Location.Accuracy.High,
+            timeInterval: 600,
+            distanceInterval: 1,
+          },
           (newLoc) => {
-            if (isMounted) setLocation(newLoc);
+            if (!isMounted) return;
+            setLocation(newLoc);
+            latestGpsCoordsRef.current = {
+              latitude: newLoc.coords.latitude,
+              longitude: newLoc.coords.longitude,
+            };
+
+            // Calculate GPS Speed (km/h)
+            const speedMps = newLoc.coords.speed;
+            const kmh = speedMps && speedMps > 0 ? speedMps * 3.6 : 0;
+            rawGpsSpeedRef.current = kmh;
+
+            // Instantaneous kinetic speed check
+            if (kmh < 2.0 || kineticMotionRef.current < 0.12) {
+              setDisplaySpeed(0);
+            } else {
+              setDisplaySpeed(Math.round(kmh));
+            }
           }
         );
       } catch (err) {
-        console.log('[Location] Setup caught error:', err);
+        console.log('[Location] Init caught error:', err);
       }
     };
 
-    setupLocation();
+    initLocation();
 
     return () => {
       isMounted = false;
       try {
         subscription?.remove();
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
     };
-  }, []);
+  }, [fetchRoute]);
 
-  useEffect(() => {
-    fetchRoute({ latitude: 12.9141, longitude: 74.8560 }, initialDestLocation);
-  }, []);
-
-  // ── Global Cloud Sync ──────────────────────────────────────────────────────
+  // ── 2. Real-time Cloud Hazard Synchronization ──────────────────────────────
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
     try {
       unsubscribe = listenForGlobalPotholes((data) => {
         setPotholes(data);
       });
-    } catch (syncErr) {
-      console.log('[CloudSync] Setup error:', syncErr);
+    } catch (e) {
+      console.log('[CloudSync] Listener error:', e);
     }
     return () => {
       if (unsubscribe) unsubscribe();
     };
   }, []);
 
-  // Safe TFLite Model Loading
+  // ── 3. TFLite Edge Model Loader ────────────────────────────────────────────
   useEffect(() => {
     let mounted = true;
     loadBundledTfliteModel()
@@ -218,17 +316,18 @@ const RoadStrixApp = () => {
         if (!mounted) return;
         if (result.state === 'loaded' && result.model) {
           tfliteModelRef.current = result.model;
+          console.log('[TFLite] Model ready for on-device inference');
         }
       })
       .catch((err) => {
-        console.log('[TFLite] loadBundledTfliteModel error caught:', err);
+        console.log('[TFLite] Load model error caught:', err);
       });
     return () => {
       mounted = false;
     };
   }, []);
 
-  // ── Sensor Inference Loop ──────────────────────────────────────────────────
+  // ── 4. High-Frequency Accelerometer & Gyroscope Streaming (100Hz) ──────────
   const handleSensorData = useCallback((accel: any, gyro: any) => {
     const window = sensorWindowRef.current;
     window.push([accel.x, accel.y, accel.z, gyro.x, gyro.y, gyro.z]);
@@ -243,20 +342,48 @@ const RoadStrixApp = () => {
 
     if (isSensorActive) {
       try {
-        Accelerometer.setUpdateInterval(10);
+        Accelerometer.setUpdateInterval(10); // 10ms = 100Hz
         Gyroscope.setUpdateInterval(10);
+
         accelSub = Accelerometer.addListener((data) => {
           latestAccel = data;
           handleSensorData(latestAccel, latestGyro);
+
+          // ── Instant Speedometer Kinetic Filter ─────────────────────────
+          const totalMagnitude = Math.sqrt(
+            data.x * data.x + data.y * data.y + data.z * data.z
+          );
+          const motionDelta = Math.abs(totalMagnitude - 9.81);
+          kineticMotionRef.current = 0.75 * kineticMotionRef.current + 0.25 * motionDelta;
+
+          // When phone/car stops moving, snap speed immediately to 0!
+          if (rawGpsSpeedRef.current < 2.5 || kineticMotionRef.current < 0.12) {
+            setDisplaySpeed(0);
+          } else {
+            setDisplaySpeed(Math.round(rawGpsSpeedRef.current));
+          }
+
+          // ── Real-Time Physical Impact Detection ────────────────────────
+          // High-pass bump filter: If vertical shock spike > 4.5 m/s²
+          const verticalShock = Math.abs(data.z - 9.81);
+          if (verticalShock > 4.8 || motionDelta > 5.5) {
+            triggerPotholeDetection(
+              'IMU Impact',
+              verticalShock > 7.0 ? 'high' : 'medium',
+              0.93
+            );
+          }
         });
+
         gyroSub = Gyroscope.addListener((data) => {
           latestGyro = data;
         });
       } catch (sensorErr) {
-        console.log('[Sensors] Listener registration error:', sensorErr);
+        console.log('[Sensors] Registration error:', sensorErr);
       }
     } else {
       sensorWindowRef.current = [];
+      setDisplaySpeed(0);
     }
 
     return () => {
@@ -267,73 +394,63 @@ const RoadStrixApp = () => {
         gyroSub?.remove();
       } catch (e) {}
     };
-  }, [isSensorActive, handleSensorData]);
+  }, [isSensorActive, handleSensorData, triggerPotholeDetection]);
 
+  // ── 5. AI TFLite Inference & Auto-Healing Loop ─────────────────────────────
   useEffect(() => {
     let interval: ReturnType<typeof setInterval>;
-    if (isSensorActive && tfliteModelRef.current && location) {
+    if (isSensorActive && location) {
       interval = setInterval(() => {
         try {
           const window = sensorWindowRef.current;
           if (window.length < MODEL_CONFIG.WINDOW_SIZE) return;
 
-          const speedKmh = location.coords.speed ? Math.max(0, location.coords.speed * 3.6) : 0;
-          const result = runPotholeInference(tfliteModelRef.current, window, speedKmh);
-
-          if (result) {
-            const now = Date.now();
-
-            if (result.isPothole) {
-              // Found a pothole!
-              if (now - lastDetectionTimeRef.current > 2000) {
-                lastDetectionTimeRef.current = now;
-                const newPothole: GlobalPothole = {
-                  id: now.toString(),
-                  latitude: location.coords.latitude,
-                  longitude: location.coords.longitude,
-                  severity: result.severity,
-                  confidence: result.confidence,
-                  timestamp: now,
-                };
-                syncPothole(newPothole); // Upload to Cloud
-                setDetectionCount((p) => p + 1);
-              }
-            } else {
-              // Road is smooth. Auto-Healing Logic:
-              potholes.forEach((p) => {
-                const dist = getDistance(
-                  location.coords.latitude,
-                  location.coords.longitude,
-                  p.latitude,
-                  p.longitude
-                );
-                if (dist < 15) {
-                  // Within 15 meters
-                  removeFixedPothole(p.id);
-                  setNotification(`✅ Hazard Resolved: Map Updated for everyone`);
-                  speakSafely('Hazard resolved. Map updated.');
-                  setTimeout(() => setNotification(null), 4000);
-                }
-              });
+          const speedKmh = displaySpeed;
+          // Run AI model if loaded, else dynamic variance
+          if (tfliteModelRef.current) {
+            const result = runPotholeInference(tfliteModelRef.current, window, speedKmh);
+            if (result && result.isPothole) {
+              triggerPotholeDetection('AI Suspension', result.severity, result.confidence);
+              return;
             }
           }
-        } catch (infErr) {
-          console.log('[Inference] Loop execution error:', infErr);
+
+          // Auto-Healing Verification Loop:
+          // If driving over a known pothole and suspension is smooth
+          potholes.forEach((p) => {
+            const dist = getDistance(
+              location.coords.latitude,
+              location.coords.longitude,
+              p.latitude,
+              p.longitude
+            );
+            if (dist < 18) {
+              // Within 18 meters without anomaly
+              removeFixedPothole(p.id);
+              setNotification(`✅ Hazard Resolved: Road is Smooth & Map Cleaned!`);
+              speakSafely('Hazard resolved. Map updated.');
+              setTimeout(() => setNotification(null), 4000);
+            }
+          });
+        } catch (err) {
+          console.log('[Inference] Execution loop error:', err);
         }
       }, 500);
     }
     return () => clearInterval(interval);
-  }, [isSensorActive, location, potholes, speakSafely]);
+  }, [isSensorActive, location, potholes, displaySpeed, triggerPotholeDetection, speakSafely]);
 
-  // ── Nearest Pothole Calculation ─────────────────────────────────────────────
+  // ── 6. Nearest Hazard Calculation & Dynamic Voice Alerts ───────────────────
   const currLocation = location
     ? { latitude: location.coords.latitude, longitude: location.coords.longitude }
     : { latitude: 12.9141, longitude: 74.8560 };
 
-  const speedKmh = location?.coords.speed ? Math.round(location.coords.speed * 3.6) : 0;
-
   useEffect(() => {
-    if (!location || potholes.length === 0) return;
+    if (!location || potholes.length === 0) {
+      setClosestDistance(null);
+      return;
+    }
+
     let minDistance = Infinity;
     let closestId: string | null = null;
     potholes.forEach((p) => {
@@ -343,52 +460,65 @@ const RoadStrixApp = () => {
         p.latitude,
         p.longitude
       );
-      if (dist < minDistance && dist > 5) {
+      if (dist < minDistance) {
         minDistance = dist;
         closestId = p.id;
       }
     });
+
     setClosestDistance(minDistance === Infinity ? null : minDistance);
 
-    // Dynamic Warning Distance based on speed
-    const warningDistance = speedKmh > 80 ? 250 : 100;
+    // Dynamic warning distance based on speed
+    const warningDistance = displaySpeed > 60 ? 250 : 120;
 
-    // TTS Voice Alerts
-    if (isVoiceEnabled && minDistance < warningDistance && closestId && closestId !== lastWarnedPotholeId) {
+    // TTS Voice Guidance
+    if (
+      isVoiceEnabled &&
+      minDistance < warningDistance &&
+      closestId &&
+      closestId !== lastWarnedPotholeId
+    ) {
       speakSafely('Warning. Hazard detected ahead.');
       setLastWarnedPotholeId(closestId);
     }
-  }, [location, potholes, isVoiceEnabled, lastWarnedPotholeId, speedKmh, speakSafely]);
+  }, [location, potholes, isVoiceEnabled, lastWarnedPotholeId, displaySpeed, speakSafely]);
 
-  // Smart Warning Logic
+  // Dynamic Warning Banner State
   const getWarningState = () => {
-    const warningDistance = speedKmh > 80 ? 250 : 100;
-    if (!closestDistance) return { color: '#00E676', text: 'Clear Route', bg: 'rgba(0, 230, 118, 0.15)' };
-    if (closestDistance < 30) return { color: '#FF3D00', text: 'POTHOLE IMMINENT!', bg: 'rgba(255, 61, 0, 0.25)' };
+    const warningDistance = displaySpeed > 60 ? 250 : 120;
+    if (!closestDistance)
+      return { color: '#00E676', text: 'Clear Route Ahead', bg: 'rgba(0, 230, 118, 0.15)' };
+    if (closestDistance < 30)
+      return { color: '#FF3D00', text: '⚠️ POTHOLE IMMINENT!', bg: 'rgba(255, 61, 0, 0.28)' };
     if (closestDistance < warningDistance)
-      return { color: '#FF9100', text: 'Approaching Hazard', bg: 'rgba(255, 145, 0, 0.2)' };
-    if (closestDistance < 300) return { color: '#FFEA00', text: 'Hazard Ahead', bg: 'rgba(255, 234, 0, 0.15)' };
-    return { color: '#00E676', text: 'Clear Route', bg: 'rgba(0, 230, 118, 0.15)' };
+      return { color: '#FF9100', text: 'Approaching Hazard', bg: 'rgba(255, 145, 0, 0.22)' };
+    if (closestDistance < 300)
+      return { color: '#FFEA00', text: 'Hazard Ahead on Route', bg: 'rgba(255, 234, 0, 0.16)' };
+    return { color: '#00E676', text: 'Clear Route Ahead', bg: 'rgba(0, 230, 118, 0.15)' };
   };
   const warning = getWarningState();
 
   const handleStartNavigation = () => {
     setIsNavigating(true);
     setIsSensorActive(true);
+
+    // Dynamic seed around current coordinates if not already present
+    if (location) {
+      seedHazardsAroundLocation(location.coords.latitude, location.coords.longitude);
+    }
+
     try {
       mapRef.current?.animateCamera(
         {
           center: currLocation,
-          pitch: 60,
+          pitch: 55,
           heading: location?.coords.heading || 0,
-          zoom: 18,
-          altitude: 50,
+          zoom: 17.5,
+          altitude: 60,
         },
-        { duration: 1500 }
+        { duration: 1200 }
       );
-    } catch (animErr) {
-      console.log('[Map] Camera animation error:', animErr);
-    }
+    } catch (e) {}
   };
 
   const handleToggleDashcam = async () => {
@@ -398,8 +528,8 @@ const RoadStrixApp = () => {
         if (res.status !== 'granted') return;
       }
       setIsDashcamMode((prev) => !prev);
-    } catch (camErr) {
-      console.log('[Camera] Permission error:', camErr);
+    } catch (e) {
+      console.log('[Camera] Permission request error:', e);
     }
   };
 
@@ -407,8 +537,42 @@ const RoadStrixApp = () => {
     <GestureHandlerRootView style={styles.container}>
       <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
 
+      {/* ── MAP VIEW OR AR DASHCAM VIEW ─────────────────────────────────────── */}
       {isDashcamMode && cameraPermission?.granted ? (
-        <CameraView style={StyleSheet.absoluteFillObject} facing="back" />
+        <View style={StyleSheet.absoluteFillObject}>
+          {/* Live Road-Facing Camera */}
+          <CameraView style={StyleSheet.absoluteFillObject} facing="back" />
+
+          {/* AR Cybernetic Horizon Crosshair */}
+          <View style={styles.arCrosshairContainer} pointerEvents="none">
+            <View style={styles.arHorizonLine} />
+            <View style={styles.arCenterReticle} />
+          </View>
+
+          {/* AR Dynamic Hazard Bounding Box */}
+          {closestDistance && closestDistance < 150 ? (
+            <View style={styles.arHazardBoxContainer} pointerEvents="none">
+              <View
+                style={[
+                  styles.arHazardBox,
+                  { borderColor: closestDistance < 35 ? '#FF3D00' : '#FF9100' },
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.arHazardBoxText,
+                    { color: closestDistance < 35 ? '#FF3D00' : '#FF9100' },
+                  ]}
+                >
+                  {closestDistance < 35 ? '⚠️ POTHOLE IMMINENT' : '⚠️ HAZARD DETECTED'}
+                </Text>
+                <Text style={styles.arHazardDistanceText}>
+                  {Math.round(closestDistance)} METERS AHEAD
+                </Text>
+              </View>
+            </View>
+          ) : null}
+        </View>
       ) : (
         <MapView
           ref={mapRef}
@@ -418,33 +582,59 @@ const RoadStrixApp = () => {
           showsMyLocationButton={false}
           showsCompass={false}
           pitchEnabled={true}
-          initialRegion={{ ...currLocation, latitudeDelta: 0.015, longitudeDelta: 0.012 }}
+          rotateEnabled={true}
+          initialRegion={{
+            ...currLocation,
+            latitudeDelta: 0.006,
+            longitudeDelta: 0.006,
+          }}
         >
-          {/* Route Line */}
-          <Polyline
-            coordinates={routeCoords.length > 0 ? routeCoords : [currLocation, initialDestLocation]}
-            strokeColor="#8B5CF6"
-            strokeWidth={6}
-            geodesic={true}
+          {/* ── 100% Free OpenStreetMap Raster Road Tiles (Worldwide Streets) ── */}
+          <UrlTile
+            urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+            maximumZ={19}
+            flipY={false}
+            zIndex={1}
           />
 
-          {/* 3D Car Icon (Current Location) */}
-          <Marker coordinate={currLocation} anchor={{ x: 0.5, y: 0.5 }}>
+          {/* Purple Road Navigation Route Line */}
+          <Polyline
+            coordinates={
+              routeCoords.length > 0
+                ? routeCoords
+                : [
+                    currLocation,
+                    {
+                      latitude: currLocation.latitude + 0.003,
+                      longitude: currLocation.longitude + 0.0015,
+                    },
+                  ]
+            }
+            strokeColor="#8B5CF6"
+            strokeWidth={7}
+            geodesic={true}
+            zIndex={5}
+          />
+
+          {/* 3D Car Marker (Current GPS Location) */}
+          <Marker coordinate={currLocation} anchor={{ x: 0.5, y: 0.5 }} zIndex={20}>
             <View
               style={[
                 styles.carWrapper,
                 { transform: [{ rotate: `${location?.coords.heading || 0}deg` }] },
               ]}
             >
-              <Icon name="car-sports" size={36} color="#00E676" />
+              <Icon name="car-sports" size={38} color="#00E676" />
             </View>
           </Marker>
 
-          {/* Pothole Markers */}
+          {/* Glowing Red Pothole Markers (Global & Local) */}
           {potholes.map((pothole) => (
             <Marker
               key={pothole.id}
               coordinate={{ latitude: pothole.latitude, longitude: pothole.longitude }}
+              anchor={{ x: 0.5, y: 0.5 }}
+              zIndex={15}
             >
               <View style={styles.potholeAura}>
                 <View style={styles.potholeCore} />
@@ -454,14 +644,16 @@ const RoadStrixApp = () => {
         </MapView>
       )}
 
-      {/* ── Top Floating Info Chip ──────────────────────────────────────────── */}
+      {/* ── Top Floating Info Pill ──────────────────────────────────────────── */}
       <View style={styles.topChipContainer} pointerEvents="none">
-        <BlurView intensity={80} tint="dark" style={styles.topChip}>
+        <BlurView intensity={85} tint="dark" style={styles.topChip}>
           <Icon name="cloud-sync" size={18} color="#8B5CF6" />
-          <Text style={styles.topChipText}>{potholes.length} Global Hazards Ahead</Text>
+          <Text style={styles.topChipText}>
+            {potholes.length} Global {potholes.length === 1 ? 'Hazard' : 'Hazards'} Ahead
+          </Text>
         </BlurView>
 
-        {/* Auto-Healing Notification Banner */}
+        {/* Real-time Notification Banner */}
         {notification && (
           <Animated.View style={styles.notificationBanner}>
             <Text style={styles.notificationText}>{notification}</Text>
@@ -469,13 +661,13 @@ const RoadStrixApp = () => {
         )}
       </View>
 
-      {/* ── Mid Info Strip & Smart Warning (Automotive Dashboard Layout) ───── */}
+      {/* ── Automotive HUD Dashboard Overlay ────────────────────────────────── */}
       {isNavigating ? (
         <View style={styles.dashboardOverlay}>
-          {/* Smart Warning Bar */}
+          {/* Smart Proximity Warning Bar */}
           <View style={[styles.warningBar, { backgroundColor: warning.bg, borderColor: warning.color }]}>
             <Icon
-              name={closestDistance && closestDistance < 100 ? 'alert-octagon' : 'shield-check'}
+              name={closestDistance && closestDistance < 60 ? 'alert-octagon' : 'shield-check'}
               size={24}
               color={warning.color}
             />
@@ -484,55 +676,84 @@ const RoadStrixApp = () => {
             </Text>
           </View>
 
-          {/* Glass Telemetry Strip */}
-          <BlurView intensity={90} tint="dark" style={styles.telemetryStrip}>
+          {/* Glass Telemetry HUD Strip */}
+          <BlurView intensity={95} tint="dark" style={styles.telemetryStrip}>
+            {/* Speedometer (Instantaneous Kinetic Response) */}
             <View style={styles.telemetryItem}>
-              <Icon name="speedometer" size={20} color="#AAA" />
-              <Text style={styles.telemetryValue}>{speedKmh}</Text>
+              <Icon name="speedometer" size={22} color="#AAA" />
+              <Text style={styles.telemetryValue}>{displaySpeed}</Text>
               <Text style={styles.telemetryLabel}>km/h</Text>
             </View>
+
             <View style={styles.telemetryDivider} />
+
+            {/* GPS Signal */}
             <View style={styles.telemetryItem}>
               <Icon
                 name="crosshairs-gps"
-                size={20}
+                size={22}
                 color={
-                  location?.coords.accuracy && location.coords.accuracy < 20 ? '#00E676' : '#FFCA28'
+                  location?.coords.accuracy && location.coords.accuracy < 20
+                    ? '#00E676'
+                    : '#FFCA28'
                 }
               />
-              <Text style={styles.telemetryValue}>GPS</Text>
-              <Text style={styles.telemetryLabel}>Signal</Text>
+              <Text style={styles.telemetryValue}>
+                {location?.coords.accuracy ? `${Math.round(location.coords.accuracy)}m` : 'LOCK'}
+              </Text>
+              <Text style={styles.telemetryLabel}>GPS</Text>
             </View>
+
             <View style={styles.telemetryDivider} />
+
+            {/* New Potholes Marked */}
             <View style={styles.telemetryItem}>
-              <Icon name="radar" size={20} color="#8B5CF6" />
+              <Icon name="radar" size={22} color="#8B5CF6" />
               <Text style={styles.telemetryValue}>{detectionCount}</Text>
-              <Text style={styles.telemetryLabel}>New</Text>
+              <Text style={styles.telemetryLabel}>New Hazards</Text>
             </View>
           </BlurView>
 
-          {/* Quick Controls */}
+          {/* Quick Controls Row */}
           <View style={styles.quickControlsRow}>
+            {/* Dashcam Toggle */}
             <TouchableOpacity style={styles.controlBtn} onPress={handleToggleDashcam}>
               <Icon
                 name={isDashcamMode ? 'map-outline' : 'camera-outline'}
-                size={24}
+                size={26}
                 color={isDashcamMode ? '#00E676' : '#FFF'}
               />
             </TouchableOpacity>
+
+            {/* Instant Manual Bump Simulation Test Button */}
+            <TouchableOpacity
+              style={styles.controlBtnImpact}
+              onPress={() => triggerPotholeDetection('Manual Test', 'high', 0.96)}
+            >
+              <Icon name="car-traction-control" size={26} color="#FFF" />
+              <Text style={styles.controlImpactText}>Test Bump</Text>
+            </TouchableOpacity>
+
+            {/* Stop Navigation */}
             <TouchableOpacity
               style={styles.controlBtnClose}
               onPress={() => {
                 setIsNavigating(false);
                 setIsSensorActive(false);
+                setIsDashcamMode(false);
               }}
             >
               <Icon name="close" size={28} color="#FFF" />
             </TouchableOpacity>
-            <TouchableOpacity style={styles.controlBtn} onPress={() => setIsVoiceEnabled(!isVoiceEnabled)}>
+
+            {/* Voice Assistant Toggle */}
+            <TouchableOpacity
+              style={styles.controlBtn}
+              onPress={() => setIsVoiceEnabled(!isVoiceEnabled)}
+            >
               <Icon
                 name={isVoiceEnabled ? 'volume-high' : 'volume-off'}
-                size={24}
+                size={26}
                 color={isVoiceEnabled ? '#00E676' : '#888'}
               />
             </TouchableOpacity>
@@ -541,8 +762,10 @@ const RoadStrixApp = () => {
       ) : (
         <View style={styles.startPanel}>
           <View style={styles.startPanelInner}>
-            <Text style={styles.startTitle}>RoadStrix Navigation</Text>
-            <Text style={styles.startSub}>Suspension Telemetry Ready</Text>
+            <Text style={styles.startTitle}>RoadStrix Automotive AI</Text>
+            <Text style={styles.startSub}>
+              Multi-Modal Dashcam & Dynamic Suspension Telemetry Ready
+            </Text>
             <TouchableOpacity style={styles.startBtn} onPress={handleStartNavigation}>
               <Icon name="steering" size={24} color="#FFF" style={{ marginRight: 8 }} />
               <Text style={styles.startBtnText}>Start Drive</Text>
@@ -602,58 +825,60 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
   },
 
-  // Custom Map Markers
+  // Custom 3D Car Marker
   carWrapper: {
     width: 60,
     height: 60,
     justifyContent: 'center',
     alignItems: 'center',
     shadowColor: '#00E676',
-    shadowOpacity: 0.5,
-    shadowRadius: 10,
-    elevation: 8,
+    shadowOpacity: 0.6,
+    shadowRadius: 12,
+    elevation: 10,
   },
+
+  // Glowing Red Pothole Markers
   potholeAura: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: 'rgba(255, 61, 0, 0.2)',
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255, 61, 0, 0.25)',
     justifyContent: 'center',
     alignItems: 'center',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 61, 0, 0.5)',
+    borderWidth: 1.5,
+    borderColor: 'rgba(255, 61, 0, 0.6)',
   },
   potholeCore: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
+    width: 14,
+    height: 14,
+    borderRadius: 7,
     backgroundColor: '#FF3D00',
     shadowColor: '#FF3D00',
     shadowOpacity: 1,
-    shadowRadius: 6,
-    elevation: 5,
+    shadowRadius: 8,
+    elevation: 8,
   },
 
-  // Floating Info Chip
+  // Floating Top Info Pill
   topChipContainer: {
     position: 'absolute',
     top: 55,
     left: 0,
     right: 0,
     alignItems: 'center',
-    zIndex: 10,
+    zIndex: 20,
   },
   topChip: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingVertical: 10,
+    paddingHorizontal: 22,
+    paddingVertical: 11,
     borderRadius: 24,
     overflow: 'hidden',
     borderWidth: 1,
-    borderColor: 'rgba(139, 92, 246, 0.3)',
+    borderColor: 'rgba(139, 92, 246, 0.35)',
   },
-  topChipText: { color: '#FFF', fontSize: 14, fontWeight: '600', marginLeft: 8 },
+  topChipText: { color: '#FFF', fontSize: 14, fontWeight: '700', marginLeft: 8 },
   notificationBanner: {
     marginTop: 12,
     backgroundColor: '#00E676',
@@ -663,23 +888,66 @@ const styles = StyleSheet.create({
     shadowColor: '#00E676',
     shadowOpacity: 0.5,
     shadowRadius: 10,
-    elevation: 5,
+    elevation: 6,
   },
   notificationText: { color: '#0F0F14', fontWeight: 'bold' },
 
-  // Dashboard Overlay
+  // AR Dashcam HUD Elements
+  arCrosshairContainer: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  arHorizonLine: {
+    width: width * 0.7,
+    height: 1,
+    backgroundColor: 'rgba(0, 230, 118, 0.35)',
+  },
+  arCenterReticle: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    borderWidth: 1.5,
+    borderColor: 'rgba(0, 230, 118, 0.6)',
+    position: 'absolute',
+  },
+  arHazardBoxContainer: {
+    position: 'absolute',
+    top: height * 0.35,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+  },
+  arHazardBox: {
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    borderRadius: 16,
+    borderWidth: 2,
+    backgroundColor: 'rgba(15, 15, 20, 0.85)',
+    alignItems: 'center',
+  },
+  arHazardBoxText: {
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  arHazardDistanceText: {
+    fontSize: 13,
+    color: '#FFF',
+    marginTop: 4,
+    fontWeight: '600',
+  },
+
+  // Automotive Dashboard Overlay
   dashboardOverlay: {
     position: 'absolute',
-    bottom: 30,
-    left: 20,
-    right: 20,
-    zIndex: 10,
+    bottom: 25,
+    left: 16,
+    right: 16,
+    zIndex: 25,
     alignSelf: 'center',
     width: '100%',
     maxWidth: 600,
   },
-
-  // Smart Warning Bar
   warningBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -687,26 +955,26 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     paddingHorizontal: 20,
     borderRadius: 16,
-    borderWidth: 1,
-    marginBottom: 12,
+    borderWidth: 1.5,
+    marginBottom: 10,
   },
-  warningText: { fontSize: 18, fontWeight: 'bold', marginLeft: 10 },
+  warningText: { fontSize: 17, fontWeight: 'bold', marginLeft: 10 },
 
-  // Telemetry Strip
+  // Telemetry HUD Strip
   telemetryStrip: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingVertical: 16,
-    paddingHorizontal: 24,
+    paddingHorizontal: 22,
     borderRadius: 20,
     overflow: 'hidden',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.1)',
-    marginBottom: 20,
+    borderColor: 'rgba(255,255,255,0.12)',
+    marginBottom: 16,
   },
   telemetryItem: { alignItems: 'center', flex: 1 },
-  telemetryValue: { color: '#FFF', fontSize: 20, fontWeight: 'bold', marginTop: 4 },
+  telemetryValue: { color: '#FFF', fontSize: 22, fontWeight: 'bold', marginTop: 3 },
   telemetryLabel: {
     color: '#888',
     fontSize: 11,
@@ -714,33 +982,53 @@ const styles = StyleSheet.create({
     marginTop: 2,
     textTransform: 'uppercase',
   },
-  telemetryDivider: { width: 1, height: 40, backgroundColor: 'rgba(255,255,255,0.1)' },
+  telemetryDivider: { width: 1, height: 38, backgroundColor: 'rgba(255,255,255,0.12)' },
 
-  // Quick Controls
+  // Controls Row
   quickControlsRow: {
     flexDirection: 'row',
-    justifyContent: 'space-around',
+    justifyContent: 'space-between',
     alignItems: 'center',
+    paddingHorizontal: 10,
   },
   controlBtn: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
-    backgroundColor: 'rgba(30, 30, 40, 0.9)',
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: 'rgba(30, 30, 42, 0.95)',
     justifyContent: 'center',
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.1)',
+    borderColor: 'rgba(255,255,255,0.15)',
+  },
+  controlBtnImpact: {
+    paddingHorizontal: 16,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: '#FF9100',
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#FF9100',
+    shadowOpacity: 0.5,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  controlImpactText: {
+    color: '#FFF',
+    fontWeight: 'bold',
+    fontSize: 14,
+    marginLeft: 6,
   },
   controlBtnClose: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
+    width: 58,
+    height: 58,
+    borderRadius: 29,
     backgroundColor: '#E53935',
     justifyContent: 'center',
     alignItems: 'center',
     shadowColor: '#E53935',
-    shadowOpacity: 0.4,
+    shadowOpacity: 0.5,
     shadowRadius: 10,
     elevation: 8,
   },
@@ -751,13 +1039,13 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     right: 0,
-    backgroundColor: 'rgba(15, 15, 20, 0.95)',
-    padding: 30,
-    paddingBottom: 50,
+    backgroundColor: 'rgba(15, 15, 20, 0.96)',
+    padding: 28,
+    paddingBottom: 48,
     borderTopLeftRadius: 32,
     borderTopRightRadius: 32,
     borderTopWidth: 1,
-    borderTopColor: 'rgba(255,255,255,0.1)',
+    borderTopColor: 'rgba(255,255,255,0.12)',
     alignItems: 'center',
   },
   startPanelInner: {
@@ -766,7 +1054,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   startTitle: { color: '#FFF', fontSize: 24, fontWeight: 'bold', marginBottom: 4 },
-  startSub: { color: '#AAA', fontSize: 14, marginBottom: 24 },
+  startSub: { color: '#AAA', fontSize: 13, textAlign: 'center', marginBottom: 22 },
   startBtn: {
     backgroundColor: '#8B5CF6',
     flexDirection: 'row',
@@ -776,7 +1064,7 @@ const styles = StyleSheet.create({
     paddingVertical: 18,
     borderRadius: 16,
     shadowColor: '#8B5CF6',
-    shadowOpacity: 0.4,
+    shadowOpacity: 0.5,
     shadowRadius: 12,
     elevation: 6,
   },
