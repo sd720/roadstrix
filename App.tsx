@@ -25,7 +25,6 @@ import {
   listenForGlobalPotholes,
   syncPothole,
   removeFixedPothole,
-  seedHazardsAroundLocation,
   GlobalPothole,
 } from './src/services/backendSync';
 
@@ -111,6 +110,7 @@ const RoadStrixApp = () => {
   const lastDetectionTimeRef = useRef<number>(0);
   const [detectionCount, setDetectionCount] = useState<number>(0);
   const [routeCoords, setRouteCoords] = useState<{ latitude: number; longitude: number }[]>([]);
+  const [drivenPath, setDrivenPath] = useState<{ latitude: number; longitude: number }[]>([]);
   const [isNavigating, setIsNavigating] = useState(false);
 
   // Dynamic Speedometer (Sensor-Fused Instantaneous Response)
@@ -228,11 +228,9 @@ const RoadStrixApp = () => {
             latitude: curLoc.coords.latitude,
             longitude: curLoc.coords.longitude,
           };
+          setDrivenPath([{ latitude: curLoc.coords.latitude, longitude: curLoc.coords.longitude }]);
 
-          // 1. Seed dynamic hazards right ahead on the user's real street!
-          seedHazardsAroundLocation(curLoc.coords.latitude, curLoc.coords.longitude);
-
-          // 2. Center map smoothly on the user's real GPS position
+          // Center map smoothly on the user's real GPS position
           mapRef.current?.animateToRegion(
             {
               latitude: curLoc.coords.latitude,
@@ -241,12 +239,6 @@ const RoadStrixApp = () => {
               longitudeDelta: 0.005,
             },
             800
-          );
-
-          // 3. Generate route ahead on their actual road
-          fetchRoute(
-            { latitude: curLoc.coords.latitude, longitude: curLoc.coords.longitude },
-            { latitude: curLoc.coords.latitude + 0.004, longitude: curLoc.coords.longitude + 0.002 }
           );
         }
 
@@ -265,13 +257,25 @@ const RoadStrixApp = () => {
               longitude: newLoc.coords.longitude,
             };
 
+            // Append real driving breadcrumb path
+            setDrivenPath((prev) => {
+              const newPt = { latitude: newLoc.coords.latitude, longitude: newLoc.coords.longitude };
+              if (prev.length === 0) return [newPt];
+              const lastPt = prev[prev.length - 1];
+              const dist = getDistance(lastPt.latitude, lastPt.longitude, newPt.latitude, newPt.longitude);
+              if (dist > 3) {
+                return [...prev, newPt];
+              }
+              return prev;
+            });
+
             // Calculate GPS Speed (km/h)
             const speedMps = newLoc.coords.speed;
             const kmh = speedMps && speedMps > 0 ? speedMps * 3.6 : 0;
             rawGpsSpeedRef.current = kmh;
 
-            // Instantaneous kinetic speed check
-            if (kmh < 2.0 || kineticMotionRef.current < 0.12) {
+            // Instantaneous kinetic speed check (automotive threshold <= 3 km/h = 0)
+            if (kmh <= 3.0 || kineticMotionRef.current < 0.15) {
               setDisplaySpeed(0);
             } else {
               setDisplaySpeed(Math.round(kmh));
@@ -354,10 +358,10 @@ const RoadStrixApp = () => {
             data.x * data.x + data.y * data.y + data.z * data.z
           );
           const motionDelta = Math.abs(totalMagnitude - 9.81);
-          kineticMotionRef.current = 0.75 * kineticMotionRef.current + 0.25 * motionDelta;
+          kineticMotionRef.current = 0.70 * kineticMotionRef.current + 0.30 * motionDelta;
 
           // When phone/car stops moving, snap speed immediately to 0!
-          if (rawGpsSpeedRef.current < 2.5 || kineticMotionRef.current < 0.12) {
+          if (rawGpsSpeedRef.current <= 3.0 || kineticMotionRef.current < 0.15) {
             setDisplaySpeed(0);
           } else {
             setDisplaySpeed(Math.round(rawGpsSpeedRef.current));
@@ -502,11 +506,6 @@ const RoadStrixApp = () => {
     setIsNavigating(true);
     setIsSensorActive(true);
 
-    // Dynamic seed around current coordinates if not already present
-    if (location) {
-      seedHazardsAroundLocation(location.coords.latitude, location.coords.longitude);
-    }
-
     try {
       mapRef.current?.animateCamera(
         {
@@ -597,24 +596,27 @@ const RoadStrixApp = () => {
             zIndex={1}
           />
 
-          {/* Purple Road Navigation Route Line */}
-          <Polyline
-            coordinates={
-              routeCoords.length > 0
-                ? routeCoords
-                : [
-                    currLocation,
-                    {
-                      latitude: currLocation.latitude + 0.003,
-                      longitude: currLocation.longitude + 0.0015,
-                    },
-                  ]
-            }
-            strokeColor="#8B5CF6"
-            strokeWidth={7}
-            geodesic={true}
-            zIndex={5}
-          />
+          {/* Real Driven Path (Real-time breadcrumbs of actual vehicle movement) */}
+          {drivenPath.length > 1 && (
+            <Polyline
+              coordinates={drivenPath}
+              strokeColor="#00E676"
+              strokeWidth={5}
+              geodesic={true}
+              zIndex={8}
+            />
+          )}
+
+          {/* Navigation Route Line (Only when navigating and route is active) */}
+          {isNavigating && routeCoords.length > 1 && (
+            <Polyline
+              coordinates={routeCoords}
+              strokeColor="#8B5CF6"
+              strokeWidth={6}
+              geodesic={true}
+              zIndex={5}
+            />
+          )}
 
           {/* 3D Car Marker (Current GPS Location) */}
           <Marker coordinate={currLocation} anchor={{ x: 0.5, y: 0.5 }} zIndex={20}>
@@ -647,9 +649,11 @@ const RoadStrixApp = () => {
       {/* ── Top Floating Info Pill ──────────────────────────────────────────── */}
       <View style={styles.topChipContainer} pointerEvents="none">
         <BlurView intensity={85} tint="dark" style={styles.topChip}>
-          <Icon name="cloud-sync" size={18} color="#8B5CF6" />
+          <Icon name="shield-check" size={18} color="#00E676" />
           <Text style={styles.topChipText}>
-            {potholes.length} Global {potholes.length === 1 ? 'Hazard' : 'Hazards'} Ahead
+            {potholes.length === 0
+              ? 'Real-Time Road Monitoring Active'
+              : `${potholes.length} Real ${potholes.length === 1 ? 'Hazard' : 'Hazards'} Logged`}
           </Text>
         </BlurView>
 
