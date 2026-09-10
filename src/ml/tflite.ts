@@ -158,7 +158,7 @@ export function runPotholeInference(
     const inputData = normaliseSensorWindow(sensorWindow);
     const { WINDOW_SIZE, NUM_CHANNELS } = MODEL_CONFIG;
 
-    // Run model: input shape [1, 50, 6], output shape [1, 50, 6]
+    // Run model: input shape [1, 300] (50 samples × 6 channels, flattened Dense Autoencoder)
     const outputData = model.runSync([inputData]);
     if (!outputData || !outputData[0]) return null;
 
@@ -183,8 +183,9 @@ export function runPotholeInference(
 
     // A pothole is an extreme deviation from the current baseline
     // (e.g., 2.5x worse than the recent road surface)
+    // We multiply threshold_default by 1.2 to give it a slightly stricter floor
     let dynamicThreshold = Math.max(
-      MODEL_CONFIG.threshold_default,
+      MODEL_CONFIG.threshold_default * 1.2,
       baselineMse * 2.5 
     );
 
@@ -222,6 +223,11 @@ export function runPotholeInference(
     const confidence = isPothole
       ? Math.min(1.0, (mse - dynamicThreshold) / (dynamicThreshold * 2))
       : 0;
+
+    // Reject very borderline detections (minimum confidence floor)
+    if (isPothole && confidence < 0.15) {
+      return { mse, isPothole: false, severity: 'low', confidence: 0 };
+    }
 
     return { mse, isPothole, severity, confidence };
   } catch (e) {

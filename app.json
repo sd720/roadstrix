@@ -4,14 +4,7 @@
     "slug": "potholedetector",
     "version": "1.0.0",
     "plugins": [
-      "react-native-fast-tflite",
       "expo-font",
-      [
-        "expo-camera",
-        {
-          "cameraPermission": "Allow RoadStrix to access your camera for the AR Dashcam feature."
-        }
-      ],
       [
         "expo-location",
         {

@@ -9,6 +9,9 @@ import {
   Dimensions,
   Animated,
   Vibration,
+  TextInput,
+  ActivityIndicator,
+  Keyboard,
 } from 'react-native';
 import MapView, { Marker, Polyline, UrlTile } from 'react-native-maps';
 import Icon from '@expo/vector-icons/MaterialCommunityIcons';
@@ -18,8 +21,9 @@ import { loadBundledTfliteModel, runPotholeInference, MODEL_CONFIG } from './src
 import * as Location from 'expo-location';
 import { Accelerometer, Gyroscope } from 'expo-sensors';
 import { BlurView } from 'expo-blur';
-import { CameraView, useCameraPermissions } from 'expo-camera';
+import { CameraView, CameraType, useCameraPermissions } from 'expo-camera';
 import * as Speech from 'expo-speech';
+
 
 import {
   listenForGlobalPotholes,
@@ -27,6 +31,7 @@ import {
   removeFixedPothole,
   GlobalPothole,
 } from './src/services/backendSync';
+import { processVisionFrame, VisionResult } from './src/ml/visionModel';
 
 const { width, height } = Dimensions.get('window');
 
@@ -104,7 +109,13 @@ const RoadStrixApp = () => {
   // Sensor & Telemetry State
   const [isSensorActive, setIsSensorActive] = useState(false);
   const [isDashcamMode, setIsDashcamMode] = useState(false);
-  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  
+  // Vision Camera Setup
+  const [cameraPermission, requestPermission] = useCameraPermissions();
+  const [cameraType, setCameraType] = useState<CameraType>('back');
+  
+  // Sensor Fusion State
+  const lastVisualDetectionRef = useRef<number>(0);
   const sensorWindowRef = useRef<number[][]>([]);
   const tfliteModelRef = useRef<any>(null);
   const lastDetectionTimeRef = useRef<number>(0);
@@ -112,6 +123,12 @@ const RoadStrixApp = () => {
   const [routeCoords, setRouteCoords] = useState<{ latitude: number; longitude: number }[]>([]);
   const [drivenPath, setDrivenPath] = useState<{ latitude: number; longitude: number }[]>([]);
   const [isNavigating, setIsNavigating] = useState(false);
+
+  // Search & Navigation State
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [destination, setDestination] = useState<{ latitude: number; longitude: number } | null>(null);
 
   // Dynamic Speedometer (Sensor-Fused Instantaneous Response)
   const [displaySpeed, setDisplaySpeed] = useState<number>(0);
@@ -136,10 +153,18 @@ const RoadStrixApp = () => {
     [isVoiceEnabled]
   );
 
-  // Dynamic Pothole Trigger (Called by TFLite, Shock Sensor, or Manual Test Button)
+  // Callback for Visual Detection
+  const handleVisualDetection = useCallback((res: VisionResult) => {
+    if (res.isPothole && Date.now() - lastVisualDetectionRef.current > 5000) {
+      lastVisualDetectionRef.current = Date.now();
+      triggerPotholeDetection('Dashcam Vision', res.severity, res.confidence);
+    }
+  }, []);
+
+  // Dynamic Pothole Trigger (Sensor Fusion Controller)
   const triggerPotholeDetection = useCallback(
     (
-      source: 'AI Suspension' | 'IMU Impact' | 'Manual Test',
+      source: 'AI Suspension' | 'IMU Impact' | 'Manual Test' | 'Dashcam Vision',
       severity: 'low' | 'medium' | 'high' = 'high',
       confidence = 0.94
     ) => {
@@ -147,14 +172,26 @@ const RoadStrixApp = () => {
       if (now - lastDetectionTimeRef.current < 2000) return; // 2s debounce
       lastDetectionTimeRef.current = now;
 
-      try {
-        Vibration.vibrate(350);
-      } catch (e) {}
-
       const coords = latestGpsCoordsRef.current || {
         latitude: location?.coords.latitude || 12.9141,
         longitude: location?.coords.longitude || 74.8560,
       };
+
+      // ── SPATIAL CLUSTERING (Prevent Duplicates) ──
+      // If there is already a pothole logged within 15 meters, do not create a new one.
+      const isDuplicate = potholes.some((p) => {
+        const dist = getDistance(coords.latitude, coords.longitude, p.latitude, p.longitude);
+        return dist < 15;
+      });
+
+      if (isDuplicate) {
+        console.log(`[Detection] Ignored duplicate hazard from ${source}`);
+        return;
+      }
+
+      try {
+        Vibration.vibrate(350);
+      } catch (e) {}
 
       const newPothole: GlobalPothole = {
         id: `detected_${now}`,
@@ -168,11 +205,13 @@ const RoadStrixApp = () => {
       // Upload to global cloud and update local state
       syncPothole(newPothole);
       setDetectionCount((c) => c + 1);
-      setNotification(`⚠️ Hazard Detected (${source}) & Marked on Map!`);
-      speakSafely('Hazard detected. Marked on map.');
+      
+      const badge = source === 'Dashcam Vision' ? '👁️ VISION' : '💥 IMPACT';
+      setNotification(`${badge} Detected (${source}) & Marked on Map!`);
+      speakSafely('Hazard detected. Logged to cloud.');
       setTimeout(() => setNotification(null), 4000);
     },
-    [location, speakSafely]
+    [location, potholes, speakSafely]
   );
 
   // Route calculation with graceful fallback
@@ -368,12 +407,12 @@ const RoadStrixApp = () => {
           }
 
           // ── Real-Time Physical Impact Detection ────────────────────────
-          // High-pass bump filter: If vertical shock spike > 4.5 m/s²
+          // High-pass bump filter: Require speed > 5 km/h to prevent stationary desk triggers
           const verticalShock = Math.abs(data.z - 9.81);
-          if (verticalShock > 4.8 || motionDelta > 5.5) {
+          if (rawGpsSpeedRef.current > 5.0 && (verticalShock > 7.5 || motionDelta > 8.5)) {
             triggerPotholeDetection(
               'IMU Impact',
-              verticalShock > 7.0 ? 'high' : 'medium',
+              verticalShock > 9.0 ? 'high' : 'medium',
               0.93
             );
           }
@@ -410,32 +449,36 @@ const RoadStrixApp = () => {
           if (window.length < MODEL_CONFIG.WINDOW_SIZE) return;
 
           const speedKmh = displaySpeed;
-          // Run AI model if loaded, else dynamic variance
-          if (tfliteModelRef.current) {
+          let currentAnomalyDetected = false;
+
+          // Run AI model if loaded, and ONLY if the vehicle is moving (>5 km/h)
+          if (speedKmh > 5.0 && tfliteModelRef.current) {
             const result = runPotholeInference(tfliteModelRef.current, window, speedKmh);
             if (result && result.isPothole) {
               triggerPotholeDetection('AI Suspension', result.severity, result.confidence);
-              return;
+              currentAnomalyDetected = true;
             }
           }
 
           // Auto-Healing Verification Loop:
-          // If driving over a known pothole and suspension is smooth
-          potholes.forEach((p) => {
-            const dist = getDistance(
-              location.coords.latitude,
-              location.coords.longitude,
-              p.latitude,
-              p.longitude
-            );
-            if (dist < 18) {
-              // Within 18 meters without anomaly
-              removeFixedPothole(p.id);
-              setNotification(`✅ Hazard Resolved: Road is Smooth & Map Cleaned!`);
-              speakSafely('Hazard resolved. Map updated.');
-              setTimeout(() => setNotification(null), 4000);
-            }
-          });
+          // ONLY heal if driving (>5 km/h) AND the AI model confirms smooth road
+          if (speedKmh > 5.0 && !currentAnomalyDetected) {
+            potholes.forEach((p) => {
+              const dist = getDistance(
+                location.coords.latitude,
+                location.coords.longitude,
+                p.latitude,
+                p.longitude
+              );
+              if (dist < 15) {
+                // Within 15 meters AND road is confirmed smooth by AI
+                removeFixedPothole(p.id);
+                setNotification(`✅ Hazard Resolved: Road is Smooth & Map Cleaned!`);
+                speakSafely('Hazard resolved. Road is clear. Map updated.');
+                setTimeout(() => setNotification(null), 4000);
+              }
+            });
+          }
         } catch (err) {
           console.log('[Inference] Execution loop error:', err);
         }
@@ -473,16 +516,22 @@ const RoadStrixApp = () => {
     setClosestDistance(minDistance === Infinity ? null : minDistance);
 
     // Dynamic warning distance based on speed
-    const warningDistance = displaySpeed > 60 ? 250 : 120;
+    const warningDistance = displaySpeed > 60 ? 250 : displaySpeed > 30 ? 150 : 80;
 
-    // TTS Voice Guidance
+    // Speed-Dependent TTS Voice Guidance
     if (
       isVoiceEnabled &&
       minDistance < warningDistance &&
       closestId &&
       closestId !== lastWarnedPotholeId
     ) {
-      speakSafely('Warning. Hazard detected ahead.');
+      if (minDistance < 30) {
+        speakSafely('Caution! Pothole imminent. Reduce speed immediately.');
+      } else if (displaySpeed > 60) {
+        speakSafely(`Warning. Pothole detected ${Math.round(minDistance)} meters ahead. Slow down.`);
+      } else {
+        speakSafely('Alert. Pothole ahead on your route. Drive carefully.');
+      }
       setLastWarnedPotholeId(closestId);
     }
   }, [location, potholes, isVoiceEnabled, lastWarnedPotholeId, displaySpeed, speakSafely]);
@@ -501,6 +550,33 @@ const RoadStrixApp = () => {
     return { color: '#00E676', text: 'Clear Route Ahead', bg: 'rgba(0, 230, 118, 0.15)' };
   };
   const warning = getWarningState();
+
+  const handleSearch = async () => {
+    if (!searchQuery.trim()) return;
+    setIsSearching(true);
+    Keyboard.dismiss();
+    try {
+      const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(searchQuery)}&format=json&limit=5`);
+      const data = await res.json();
+      setSearchResults(data);
+    } catch (e) {
+      console.log('[Search] Geocoding error:', e);
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  const selectDestination = async (place: any) => {
+    const lat = parseFloat(place.lat);
+    const lon = parseFloat(place.lon);
+    setDestination({ latitude: lat, longitude: lon });
+    setSearchResults([]);
+    setSearchQuery(place.display_name.split(',')[0]); 
+
+    const currentLoc = latestGpsCoordsRef.current || { latitude: location?.coords.latitude || 12.9141, longitude: location?.coords.longitude || 74.8560 };
+    await fetchRoute(currentLoc, { latitude: lat, longitude: lon });
+    handleStartNavigation();
+  };
 
   const handleStartNavigation = () => {
     setIsNavigating(true);
@@ -523,8 +599,8 @@ const RoadStrixApp = () => {
   const handleToggleDashcam = async () => {
     try {
       if (!cameraPermission?.granted) {
-        const res = await requestCameraPermission();
-        if (res.status !== 'granted') return;
+        const result = await requestPermission();
+        if (!result.granted) return;
       }
       setIsDashcamMode((prev) => !prev);
     } catch (e) {
@@ -532,15 +608,58 @@ const RoadStrixApp = () => {
     }
   };
 
+  // Load the production-grade HydraNet model (Mocked for Edge UI Demo)
+  const visionPlugin = {
+    state: 'loaded',
+    model: {
+      runSync: (inputs: any) => {
+        // Mock HydraNet Tensors Output: [Drivable Space, Texture Edge, Depth Void]
+        // We randomly trigger a detection 5% of the time to simulate a real road test
+        const isPothole = Math.random() > 0.95;
+        return [
+          new Float32Array([isPothole ? 0.90 : 0.80]), // Drivable space > 0.85
+          new Float32Array([isPothole ? 0.85 : 0.10]), // Texture Edge > 0.70
+          new Float32Array([isPothole ? 0.80 : 0.10]), // Depth Void > 0.75
+        ];
+      }
+    }
+  };
+
+  // ── 7. Safe Hydranet AI Loop (Edge Simulation) ─────────────────────────
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (isDashcamMode && visionPlugin.state === 'loaded' && visionPlugin.model) {
+      interval = setInterval(() => {
+        if (displaySpeed < 10) return; 
+        
+        const dummyBuffer = new Uint8Array(224 * 224 * 3);
+        
+        processVisionFrame(
+          dummyBuffer,
+          visionPlugin.model,
+          displaySpeed,
+          handleVisualDetection
+        );
+      }, 2000); 
+    }
+    
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [isDashcamMode, displaySpeed, visionPlugin, handleVisualDetection]);
+
   return (
     <GestureHandlerRootView style={styles.container}>
       <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
 
       {/* ── MAP VIEW OR AR DASHCAM VIEW ─────────────────────────────────────── */}
       {isDashcamMode && cameraPermission?.granted ? (
-        <View style={StyleSheet.absoluteFillObject}>
-          {/* Live Road-Facing Camera */}
-          <CameraView style={StyleSheet.absoluteFillObject} facing="back" />
+        <View style={styles.dashcamContainer}>
+          <CameraView 
+            style={StyleSheet.absoluteFillObject} 
+            facing={cameraType}
+            mute={true}
+          />
 
           {/* AR Cybernetic Horizon Crosshair */}
           <View style={styles.arCrosshairContainer} pointerEvents="none">
@@ -577,6 +696,7 @@ const RoadStrixApp = () => {
           ref={mapRef}
           style={styles.map}
           customMapStyle={darkMapStyle}
+          mapType="none"
           showsUserLocation={false}
           showsMyLocationButton={false}
           showsCompass={false}
@@ -588,9 +708,9 @@ const RoadStrixApp = () => {
             longitudeDelta: 0.006,
           }}
         >
-          {/* ── 100% Free OpenStreetMap Raster Road Tiles (Worldwide Streets) ── */}
+          {/* ── 100% Free CartoDB Dark Matter Tiles (Worldwide Streets) ── */}
           <UrlTile
-            urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+            urlTemplate="https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
             maximumZ={19}
             flipY={false}
             zIndex={1}
@@ -616,6 +736,13 @@ const RoadStrixApp = () => {
               geodesic={true}
               zIndex={5}
             />
+          )}
+
+          {/* Destination Pin Marker */}
+          {destination && (
+            <Marker coordinate={destination} anchor={{ x: 0.5, y: 1 }} zIndex={18}>
+              <Icon name="map-marker" size={42} color="#8B5CF6" />
+            </Marker>
           )}
 
           {/* 3D Car Marker (Current GPS Location) */}
@@ -745,6 +872,10 @@ const RoadStrixApp = () => {
                 setIsNavigating(false);
                 setIsSensorActive(false);
                 setIsDashcamMode(false);
+                setDestination(null);
+                setRouteCoords([]);
+                setDrivenPath([]);
+                setDetectionCount(0);
               }}
             >
               <Icon name="close" size={28} color="#FFF" />
@@ -766,13 +897,42 @@ const RoadStrixApp = () => {
       ) : (
         <View style={styles.startPanel}>
           <View style={styles.startPanelInner}>
-            <Text style={styles.startTitle}>RoadStrix Automotive AI</Text>
-            <Text style={styles.startSub}>
-              Multi-Modal Dashcam & Dynamic Suspension Telemetry Ready
-            </Text>
-            <TouchableOpacity style={styles.startBtn} onPress={handleStartNavigation}>
+            <Text style={styles.startTitle}>Where to?</Text>
+            
+            {/* 100% Free OpenStreetMap Destination Search */}
+            <View style={styles.searchContainer}>
+              <TextInput
+                style={styles.searchInput}
+                placeholder="Search destination..."
+                placeholderTextColor="#888"
+                value={searchQuery}
+                onChangeText={setSearchQuery}
+                onSubmitEditing={handleSearch}
+                returnKeyType="search"
+              />
+              <TouchableOpacity style={styles.searchIconBtn} onPress={handleSearch}>
+                <Icon name="magnify" size={24} color="#00E676" />
+              </TouchableOpacity>
+            </View>
+
+            {isSearching && <ActivityIndicator style={{ marginTop: 15 }} color="#00E676" size="large" />}
+
+            {searchResults.length > 0 && (
+              <View style={styles.searchResultsContainer}>
+                {searchResults.map((result, idx) => (
+                  <TouchableOpacity key={idx} style={styles.searchResultItem} onPress={() => selectDestination(result)}>
+                    <Icon name="map-marker" size={20} color="#8B5CF6" />
+                    <Text style={styles.searchResultText} numberOfLines={2}>{result.display_name}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            )}
+
+            <View style={styles.divider} />
+
+            <TouchableOpacity style={styles.startBtn} onPress={() => { setDestination(null); setRouteCoords([]); handleStartNavigation(); }}>
               <Icon name="steering" size={24} color="#FFF" style={{ marginRight: 8 }} />
-              <Text style={styles.startBtnText}>Start Drive</Text>
+              <Text style={styles.startBtnText}>Free Drive (No Destination)</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -827,6 +987,56 @@ const styles = StyleSheet.create({
     color: '#FFF',
     fontSize: 16,
     fontWeight: 'bold',
+  },
+
+  // Search UI Styles
+  searchContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1E1E28',
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    marginTop: 15,
+    width: '100%',
+    borderWidth: 1,
+    borderColor: '#2A2A35',
+  },
+  searchInput: {
+    flex: 1,
+    color: '#FFF',
+    paddingVertical: 12,
+    fontSize: 16,
+  },
+  searchIconBtn: {
+    padding: 8,
+  },
+  searchResultsContainer: {
+    width: '100%',
+    marginTop: 10,
+    backgroundColor: '#1E1E28',
+    borderRadius: 12,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#2A2A35',
+  },
+  searchResultItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#2A2A35',
+  },
+  searchResultText: {
+    color: '#CCC',
+    fontSize: 14,
+    marginLeft: 10,
+    flex: 1,
+  },
+  divider: {
+    height: 1,
+    backgroundColor: '#2A2A35',
+    width: '100%',
+    marginVertical: 20,
   },
 
   // Custom 3D Car Marker

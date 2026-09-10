@@ -1,3 +1,6 @@
+import { collection, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
+import { db } from './firebaseConfig';
+
 export type GlobalPothole = {
   id: string;
   latitude: number;
@@ -7,43 +10,48 @@ export type GlobalPothole = {
   timestamp: number;
 };
 
-// Real-time Cloud Hazard Database (Potholes logged only via genuine detections)
-let cloudDatabase: GlobalPothole[] = [];
-
-let listeners: ((data: GlobalPothole[]) => void)[] = [];
-
-const notifyListeners = () => {
-  listeners.forEach((listener) => listener([...cloudDatabase]));
-};
-
-
 /**
- * Simulates connecting to Firebase/AWS and subscribing to a real-time stream of nearby potholes.
+ * Connects to Firebase Firestore and subscribes to a real-time stream of potholes.
  */
 export const listenForGlobalPotholes = (callback: (data: GlobalPothole[]) => void) => {
-  listeners.push(callback);
+  try {
+    const potholesRef = collection(db, 'potholes');
+    
+    // onSnapshot sets up a real-time listener that fires every time the 'potholes' collection changes
+    const unsubscribe = onSnapshot(potholesRef, (snapshot) => {
+      const potholes: GlobalPothole[] = [];
+      snapshot.forEach((doc) => {
+        potholes.push(doc.data() as GlobalPothole);
+      });
+      // Sort by timestamp descending so newest are first
+      potholes.sort((a, b) => b.timestamp - a.timestamp);
+      callback(potholes);
+    }, (error) => {
+      console.log('[Firebase] Real-time listener error (Is your config correct?):', error);
+      // Fallback: send empty array if config is invalid so app doesn't crash
+      callback([]);
+    });
 
-  // Return current state immediately
-  callback([...cloudDatabase]);
-
-  // Return unsubscribe function
-  return () => {
-    listeners = listeners.filter((l) => l !== callback);
-  };
+    return unsubscribe;
+  } catch (error) {
+    console.log('[Firebase] Initialization error. Did you add your config to firebaseConfig.ts?');
+    callback([]);
+    return () => {}; // Dummy unsubscribe
+  }
 };
 
 /**
  * Uploads a newly detected pothole to the global cloud database.
  */
 export const syncPothole = async (pothole: GlobalPothole): Promise<void> => {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      // Add to front so newly detected potholes take priority
-      cloudDatabase.unshift(pothole);
-      notifyListeners();
-      resolve();
-    }, 200); // 200ms latency
-  });
+  try {
+    // We use the pothole ID as the document ID to prevent duplicates
+    const docRef = doc(db, 'potholes', pothole.id);
+    await setDoc(docRef, pothole);
+    console.log(`[Firebase] Pothole ${pothole.id} synced globally!`);
+  } catch (error) {
+    console.log('[Firebase] Upload failed (Waiting for real config). Error:', error);
+  }
 };
 
 /**
@@ -51,12 +59,11 @@ export const syncPothole = async (pothole: GlobalPothole): Promise<void> => {
  * if a driver verifies that it has been fixed.
  */
 export const removeFixedPothole = async (id: string): Promise<void> => {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      cloudDatabase = cloudDatabase.filter((p) => p.id !== id);
-      notifyListeners();
-      console.log(`[CloudSync] Pothole ${id} verified as fixed and removed globally.`);
-      resolve();
-    }, 150);
-  });
+  try {
+    const docRef = doc(db, 'potholes', id);
+    await deleteDoc(docRef);
+    console.log(`[Firebase] Pothole ${id} verified as fixed and removed globally!`);
+  } catch (error) {
+    console.log('[Firebase] Delete failed. Error:', error);
+  }
 };
