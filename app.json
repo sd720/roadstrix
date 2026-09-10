@@ -10,6 +10,12 @@
         {
           "locationAlwaysAndWhenInUsePermission": "Allow RoadStrix to use your location to map hazards."
         }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow RoadStrix to use the camera for pothole detection via dashcam."
+        }
       ]
     ],
     "assetBundlePatterns": [
@@ -20,14 +26,10 @@
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.CAMERA",
-        "android.permission.RECORD_AUDIO"
+        "android.permission.RECORD_AUDIO",
+        "android.permission.INTERNET"
       ],
-      "package": "com.shriramkg.potholedetector",
-      "config": {
-        "googleMaps": {
-          "apiKey": "AIzaSyD-PlaceholderRoadStrixKeyInit00"
-        }
-      }
+      "package": "com.shriramkg.potholedetector"
     },
     "splash": {
       "image": "./assets/logo.png",
